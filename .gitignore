@@ -7,3 +7,15 @@ __pycache__/
 
 # 本地 Home Assistant 调试环境与配置
 ha_run/
+
+# 忽略安装包与大文件
+*.ipa
+*.har
+
+# 忽略本地逆向分析目录与敏感测试数据
+电信13.4-接口分析/
+联通13.1-接口分析/
+*.log
+*token*.json
+*state*.json
+*result*.json
