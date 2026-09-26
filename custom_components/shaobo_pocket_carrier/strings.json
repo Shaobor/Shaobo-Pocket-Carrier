@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "添加运营商手机号账户",
+        "description": "请选择运营商并输入手机号。支持添加多个手机号，每个号码在系统中将被独立管理。",
+        "data": {
+          "carrier": "运营商网络",
+          "phone": "手机号码"
+        }
+      },
+      "telecom_sms": {
+        "title": "中国电信短信验证",
+        "description": "已向您的电信手机号 **{phone}** 发送短信验证码，请在下方输入完成绑定：",
+        "data": {
+          "sms_code": "6 位短信验证码"
+        }
+      },
+      "unicom_slider": {
+        "title": "中国联通安全滑块验证",
+        "description": "因联通风控机制，请点击下方链接完成一次滑块验证以获取短信：\n\n👉 **[点击直接在新标签页打开腾讯滑块验证]({slider_url})**\n\n验证通过后短信将立即下发，请在下方输入收到的短信验证码：",
+        "data": {
+          "sms_code": "6 位短信验证码"
+        }
+      },
+      "reauth_confirm": {
+        "title": "重新认证运营商账户",
+        "description": "您的 **{carrier}** 手机号 **{phone}** 登录凭据已过期。\n\n点击“下一步/提交”将开启安全验证以重新连接该手机号。",
+        "data": {}
+      }
+    },
+    "error": {
+      "invalid_phone": "手机号码格式不正确，请输入 11 位有效数字",
+      "sms_send_failed": "短信下发失败，可能因运营商滑块风控拦截，请稍后再试",
+      "unicom_risk_failed": "联通风控协商异常，请检查网络连接后重试",
+      "invalid_sms_code": "短信验证码错误或已过期，请重新核对输入"
+    },
+    "abort": {
+      "already_configured": "该手机号已经添加过，无需重复添加！",
+      "already_in_progress": "该手机号的配置正在进行中，您可以直接继续或稍后再试。",
+      "reauth_successful": "手机号登录凭据已成功更新并重新上线！"
+    }
+  }
+}
+
