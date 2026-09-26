@@ -4,3 +4,6 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# 本地 Home Assistant 调试环境与配置
+ha_run/
