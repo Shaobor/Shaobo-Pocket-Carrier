@@ -40,6 +40,35 @@
       "already_in_progress": "该手机号的配置正在进行中，您可以直接继续或稍后再试。",
       "reauth_successful": "手机号登录凭据已成功更新并重新上线！"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "运营商高级配置选项",
+        "description": "自定义 **{carrier}** 手机号 ({phone}) 的运行参数与高级功能：",
+        "data": {
+          "scan_interval": "数据自动刷新间隔 (分钟，最低 5 分钟)",
+          "call_start_date": "通话记录查询月份/起始日 (当月查至当天，历史月份自动查至该月最后一天)",
+          "auth_action": "通话详单认证操作 (选填，仅电信)"
+        }
+      },
+      "telecom_call_auth": {
+        "title": "中国电信通话详单二次实名认证",
+        "description": "为保护隐私安全，查询电信手机号 **{phone}** 通话流水需进行二次鉴权。系统已下发短信验证码，请核对信息并输入验证码以激活查询授权：",
+        "data": {
+          "user_name": "机主真实姓名 (选填)",
+          "id_card": "身份证号码 (选填)",
+          "sms_code": "6 位短信验证码"
+        }
+      }
+    },
+    "error": {
+      "interval_too_small": "数据刷新间隔最低不能小于 5 分钟，请重新输入！",
+      "invalid_interval": "输入的刷新间隔格式无效，请输入正整数！",
+      "invalid_sms_code": "短信验证码错误或已过期，请重新核对输入！",
+      "sms_send_failed": "短信验证码下发失败，请稍后重试！",
+      "call_auth_failed": "通话详单认证失败，请核对姓名、身份证号或验证码后重试！"
+    }
   }
 }
 

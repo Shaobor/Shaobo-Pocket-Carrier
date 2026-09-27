@@ -194,9 +194,17 @@ class UnicomBalanceSensor(BaseCarrierSensor):
         return self.data.get("balance")
 
     @property
+    def icon(self) -> str:
+        bal = self.native_value
+        return "mdi:cash-remove" if bal is not None and bal < 0 else "mdi:cash-multiple"
+
+    @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         combined = self.data.get("combined_account", "独立账户")
+        bal = self.native_value or 0.0
+        is_arrears = bal < 0
         return {
+            "当前状态": "欠费" if is_arrears else "正常",
             "本月存入": f"{self.data.get('fee_deposit', 0.0):.2f} 元",
             "本月消费": f"{self.data.get('charge', 0.0):.2f} 元",
             "上月结转": f"{self.data.get('fee_rollover', 0.0):.2f} 元",
@@ -206,7 +214,8 @@ class UnicomBalanceSensor(BaseCarrierSensor):
             "最近交费金额": f"{self.data.get('last_pay_fee', '0.00')} 元",
             "账户类型": combined,
             "是否合账": "是" if "合账" in combined else "否",
-            "是否欠费": "是" if (self.native_value or 0) < 0 else "否",
+            "是否欠费": "是" if is_arrears else "否",
+            "欠费金额": f"{abs(bal):.2f} 元" if is_arrears else "0.00 元",
             "数据截至": self.data.get("flush_time", ""),
             "运营商": "中国联通",
         }
@@ -364,13 +373,23 @@ class UnicomAccountSensor(BaseCarrierSensor):
 
     @property
     def native_value(self) -> str:
-        return "正常"
+        bal = self.data.get("balance", 0.0)
+        return "欠费" if (bal or 0.0) < 0 else "正常"
+
+    @property
+    def icon(self) -> str:
+        bal = self.data.get("balance", 0.0)
+        return "mdi:account-alert" if (bal or 0.0) < 0 else "mdi:account-check"
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
+        bal = self.data.get("balance", 0.0)
+        is_arrears = (bal or 0.0) < 0
         return {
             "手机号": self.phone,
             "运营商": "中国联通",
+            "是否欠费": "是" if is_arrears else "否",
+            "欠费金额": f"{abs(bal):.2f} 元" if is_arrears else "0.00 元",
             "滚动保活": "每3分钟自动续期",
             "脱敏号码": self.data.get("desmobile", ""),
             "截至统计": self.data.get("flush_time", ""),
@@ -390,6 +409,18 @@ class UnicomLastUpdateSensor(BaseCarrierSensor):
     @property
     def native_value(self) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        interval_desc = "10分钟自动更新"
+        if hasattr(self.coordinator, "update_interval") and self.coordinator.update_interval:
+            mins = int(self.coordinator.update_interval.total_seconds() // 60)
+            interval_desc = f"{mins}分钟自动更新"
+        return {
+            "轮询间隔": interval_desc,
+            "凭证状态": "短效Token滚动保活",
+            "运营商": "中国联通",
+        }
 
 
 def get_unicom_sensors(coordinator, phone: str) -> List[BaseCarrierSensor]:

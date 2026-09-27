@@ -29,7 +29,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     auth_data = entry.data.get(CONF_AUTH_DATA) or {}
 
     if carrier == CARRIER_TELECOM:
-        coordinator = TelecomDataUpdateCoordinator(hass, phone, auth_data)
+        coordinator = TelecomDataUpdateCoordinator(hass, phone, auth_data, entry=entry)
     elif carrier == CARRIER_UNICOM:
         coordinator = UnicomDataUpdateCoordinator(hass, phone, auth_data, entry=entry)
     else:
@@ -46,9 +46,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "phone": phone,
     }
 
+    # 注册配置选项更新监听器
+    entry.async_on_unload(entry.add_update_listener(async_update_options))
+
     # 转发加载 Sensor 平台
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """当用户更新集成选项时，重新加载条目以应用新设置"""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """卸载指定手机号条目"""

@@ -19,6 +19,7 @@ from ..const import (
     SENSOR_FLOW_USED,
     SENSOR_VOICE_REMAIN,
     SENSOR_VOICE_USED,
+    SENSOR_CALL_RECORD,
     SENSOR_INTEGRAL,
     SENSOR_LOCATION,
     SENSOR_ACCOUNT_STATUS,
@@ -81,7 +82,8 @@ class TelecomRealNameSensor(BaseCarrierSensor):
         name = self.data.get("account_name")
         if name and str(name).strip():
             return str(name).strip()
-        return "错误"
+        mask = lambda p: p[:3] + "****" + p[-4:] if len(p) == 11 else p
+        return f"电信用户 ({mask(self.phone)})"
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
@@ -177,14 +179,23 @@ class TelecomBalanceSensor(BaseCarrierSensor):
         return self.data.get("balance")
 
     @property
+    def icon(self) -> str:
+        bal = self.native_value
+        return "mdi:cash-remove" if bal is not None and bal < 0 else "mdi:cash-multiple"
+
+    @property
     def extra_state_attributes(self) -> Dict[str, Any]:
+        bal = self.native_value or 0.0
+        is_arrears = bal < 0
         attrs = {
             "运营商": "中国电信",
-            "当前可用话费": f"{self.native_value or 0.0:.2f} 元",
+            "当前状态": "欠费" if is_arrears else "正常",
+            "当前可用话费": f"{bal:.2f} 元" if not is_arrears else f"-{abs(bal):.2f} 元",
+            "欠费金额": f"{abs(bal):.2f} 元" if is_arrears else "0.00 元",
             "包含通用余额": f"{self.data.get('balance_general', '0.00')} 元",
             "包含专用余额": self.data.get("balance_special", "0.00元"),
             "本月已消费": f"{self.data.get('charge', 0.0):.2f} 元",
-            "是否欠费": "是" if (self.native_value or 0) < 0 else "否",
+            "是否欠费": "是" if is_arrears else "否",
         }
         for k, v in self.data.get("history_bills", {}).items():
             attrs[f"历史{k}"] = v
@@ -347,14 +358,23 @@ class TelecomAccountSensor(BaseCarrierSensor):
 
     @property
     def native_value(self) -> str:
-        return "正常"
+        bal = self.data.get("balance", 0.0)
+        return "欠费" if (bal or 0.0) < 0 else "正常"
+
+    @property
+    def icon(self) -> str:
+        bal = self.data.get("balance", 0.0)
+        return "mdi:account-alert" if (bal or 0.0) < 0 else "mdi:account-check"
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         bal = self.data.get("balance", 0.0)
+        is_arrears = (bal or 0.0) < 0
         return {
             "手机号码": self.phone,
-            "是否欠费": "是" if bal < 0 else "否",
+            "当前状态": "欠费" if is_arrears else "正常",
+            "是否欠费": "是" if is_arrears else "否",
+            "欠费金额": f"{abs(bal):.2f} 元" if is_arrears else "0.00 元",
             "当前话费": f"{bal:.2f} 元",
             "家庭融合": "已生效",
             "运营商": "中国电信",
@@ -377,15 +397,19 @@ class TelecomLastUpdateSensor(BaseCarrierSensor):
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
+        interval_desc = "30分钟自动更新"
+        if hasattr(self.coordinator, "update_interval") and self.coordinator.update_interval:
+            mins = int(self.coordinator.update_interval.total_seconds() // 60)
+            interval_desc = f"{mins}分钟自动更新"
         return {
-            "轮询间隔": "30分钟自动更新",
+            "轮询间隔": interval_desc,
             "凭证状态": "长效Token有效",
             "运营商": "中国电信",
         }
 
 
-def get_telecom_sensors(coordinator, phone: str) -> List[BaseCarrierSensor]:
-    """生成该电信手机号下的专属传感器实例 (精炼12个核心实体，包含机主姓名、余额、消费、515G合并流量、语音、积分等)"""
+def get_telecom_sensors(coordinator, phone: str, entry=None) -> List[BaseCarrierSensor]:
+    """生成电信传感器列表 (包含自动根据手机号生成签名的通话记录传感器)"""
     return [
         TelecomRealNameSensor(coordinator, phone),
         TelecomPhoneSensor(coordinator, phone),
@@ -399,4 +423,95 @@ def get_telecom_sensors(coordinator, phone: str) -> List[BaseCarrierSensor]:
         TelecomLocationSensor(coordinator, phone),
         TelecomAccountSensor(coordinator, phone),
         TelecomLastUpdateSensor(coordinator, phone),
+        TelecomCallRecordSensor(coordinator, phone),
     ]
+
+
+class TelecomCallRecordSensor(BaseCarrierSensor):
+    """电信通话记录传感器 (语音详单，需要配置 signatureString)"""
+
+    def __init__(self, coordinator, phone: str):
+        desc = SensorEntityDescription(
+            key=SENSOR_CALL_RECORD,
+            name="通话记录",
+            icon="mdi:phone-log",
+        )
+        super().__init__(coordinator, CARRIER_TELECOM, phone, desc)
+
+    @property
+    def native_value(self) -> str:
+        if self.data.get("call_need_auth"):
+            return "详单授权已过期 (需重新认证)"
+        last = self.data.get("last_call") or {}
+        if last.get("call_time"):
+            target = last.get("calle_no", "未知")
+            call_dir = last.get("type", "")
+            if "主叫" in call_dir:
+                call_dir = "呼叫"
+            elif "被叫" in call_dir:
+                call_dir = "接听"
+            return f"{call_dir} {target} ({last.get('duration', '')})"
+        return "本月暂无通话"
+
+    @property
+    def icon(self) -> str:
+        if self.data.get("call_need_auth"):
+            return "mdi:shield-lock-outline"
+        last = self.data.get("last_call") or {}
+        call_dir = last.get("type", "")
+        if "接听" in call_dir or "被叫" in call_dir:
+            return "mdi:phone-incoming"
+        if "呼叫" in call_dir or "主叫" in call_dir:
+            return "mdi:phone-outgoing"
+        return "mdi:phone-log"
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        records = self.data.get("call_records") or []
+        masked_list = []
+        for r in records[:30]:
+            call_type = r.get("type", "")
+            if "主叫" in call_type:
+                call_type = "呼叫"
+            elif "被叫" in call_type:
+                call_type = "接听"
+            masked_list.append({
+                "call_time": r.get("call_time", ""),
+                "type": call_type,                   # 呼叫/接听
+                "call_type": r.get("call_type", ""),  # 国内通话/漫游
+                "phone_number": r.get("calle_no", ""),
+                "duration": r.get("duration", ""),
+                "location": r.get("call_area", ""),
+                "fee": r.get("total_charge", "0元"),
+            })
+        auth_status = self.data.get("call_auth_status") or ("已过期 (需重新认证)" if self.data.get("call_need_auth") else "有效")
+        rem_min = self.data.get("call_auth_remaining_minutes", 0)
+
+        last = self.data.get("last_call") or {}
+        last_formatted = {}
+        if last.get("call_time"):
+            last_type = last.get("type", "")
+            if "主叫" in last_type:
+                last_type = "呼叫"
+            elif "被叫" in last_type:
+                last_type = "接听"
+            last_formatted = {
+                "call_time": last.get("call_time", ""),
+                "type": last_type,
+                "call_type": last.get("call_type", ""),
+                "phone_number": last.get("calle_no", ""),
+                "duration": last.get("duration", ""),
+                "location": last.get("call_area", ""),
+                "fee": last.get("total_charge", "0元"),
+            }
+
+        return {
+            "运营商": "中国电信",
+            "本月通话次数": self.data.get("call_count", len(records)),
+            "查询起始日期": self.data.get("call_start_date", "当月月初"),
+            "查询截至日期": self.data.get("call_end_date", "当天"),
+            "详单授权状态": auth_status,
+            "授权剩余有效时长": f"{rem_min} 分钟" if not self.data.get("call_need_auth") else "0 分钟",
+            "最近一次通话": last_formatted,
+            "通话流水清单": masked_list,
+        }

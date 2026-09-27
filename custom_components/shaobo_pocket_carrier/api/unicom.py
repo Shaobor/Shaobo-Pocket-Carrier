@@ -305,7 +305,15 @@ class UnicomClient:
                 title = item.get("remainTitle", "")
                 if t == "fee":
                     try:
-                        data_out["balance"] = float(num or 0.0)
+                        val = float(num or 0.0)
+                        is_arrears = (
+                            "欠费" in title
+                            or "欠费" in data_out.get("balance_title", "")
+                            or str(item.get("isWarn", "")) == "1"
+                        )
+                        data_out["balance"] = -abs(val) if is_arrears else val
+                        if is_arrears:
+                            data_out["balance_title"] = title or "当前欠费"
                     except Exception:
                         pass
                 elif t == "flow":
@@ -341,10 +349,27 @@ class UnicomClient:
                 timeout=8,
             )
             j_bal = r_bal.json()
-            if j_bal.get("code") == "0000" or j_bal.get("curntbalancecust"):
-                # 精确话费余额
-                if j_bal.get("curntbalancecust"):
-                    data_out["balance"] = float(j_bal["curntbalancecust"])
+            if j_bal.get("code") == "0000" or j_bal.get("curntbalancecust") or j_bal.get("overBalance"):
+                # 优先检查欠费字段 overBalance / realowefee / owefee
+                over_bal = j_bal.get("overBalance") or j_bal.get("realowefee") or j_bal.get("owefee")
+                try:
+                    over_val = float(over_bal) if over_bal is not None else 0.0
+                except (ValueError, TypeError):
+                    over_val = 0.0
+
+                if over_val > 0:
+                    data_out["balance"] = -abs(over_val)
+                    data_out["balance_title"] = "当前欠费"
+                elif j_bal.get("curntbalancecust") is not None:
+                    try:
+                        cust_bal = float(j_bal["curntbalancecust"])
+                        # 若标题或上下文已确认为欠费，且余额为正数，则取负值
+                        if "欠费" in data_out.get("balance_title", "") and cust_bal > 0:
+                            data_out["balance"] = -abs(cust_bal)
+                        else:
+                            data_out["balance"] = cust_bal
+                    except Exception:
+                        pass
                 
                 # 本月消费
                 charge_total = float(j_bal.get("realfeecust") or j_bal.get("totalrealfee") or 0.0)

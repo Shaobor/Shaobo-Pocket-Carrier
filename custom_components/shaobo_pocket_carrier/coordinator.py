@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """中国运营商专属协调器模块 (电信/联通模块化隔离)"""
 import logging
+import datetime
 from datetime import timedelta
 from typing import Any, Dict
 
@@ -14,6 +15,13 @@ from .const import (
     UPDATE_INTERVAL_UNICOM,
     CARRIER_UNICOM,
     CarrierAuthExpiredError,
+    CONF_SCAN_INTERVAL,
+    CONF_CALL_START_DATE,
+    CONF_SIGNATURE_STRING,
+    CONF_SIGNATURE_TIMESTAMP,
+    MIN_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL_TELECOM,
+    DEFAULT_SCAN_INTERVAL_UNICOM,
 )
 from .api.telecom import TelecomClient
 from .api.unicom import UnicomClient
@@ -22,22 +30,48 @@ from .storage import async_save_carrier_account
 _LOGGER = logging.getLogger(__name__)
 
 class TelecomDataUpdateCoordinator(DataUpdateCoordinator):
-    """中国电信独立数据协调器 (长效Token，定时30分钟轮询)"""
+    """中国电信独立数据协调器 (长效Token，定时动态轮询)"""
 
-    def __init__(self, hass: HomeAssistant, phone: str, auth_data: dict) -> None:
+    def __init__(self, hass: HomeAssistant, phone: str, auth_data: dict, entry=None) -> None:
         self.phone = phone
+        self.entry = entry
         self.client = TelecomClient(phone, auth_data)
+
+        interval_min = DEFAULT_SCAN_INTERVAL_TELECOM
+        if entry:
+            try:
+                interval_min = int(entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_TELECOM))
+            except Exception:
+                interval_min = DEFAULT_SCAN_INTERVAL_TELECOM
+
+        interval_min = max(MIN_SCAN_INTERVAL, interval_min)
+
         super().__init__(
             hass,
             _LOGGER,
             name=f"China Telecom ({phone})",
-            update_interval=timedelta(seconds=UPDATE_INTERVAL_TELECOM),
+            update_interval=timedelta(minutes=interval_min),
         )
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """异步拉取电信数据"""
         try:
-            data = await self.hass.async_add_executor_job(self.client.fetch_all_data)
+            start_date = ""
+            signature_string = ""
+            signature_timestamp = 0.0
+            if self.entry:
+                start_date = str(self.entry.options.get(CONF_CALL_START_DATE, "") or "").strip()
+                # 若保存的是当月1日，自动转为空字符串，使得跨月到新月份时无需配置即可自动滚动到新月份1日
+                if start_date == datetime.date.today().replace(day=1).strftime("%Y-%m-%d"):
+                    start_date = ""
+                signature_string = str(self.entry.options.get(CONF_SIGNATURE_STRING, "") or "").strip()
+                try:
+                    signature_timestamp = float(self.entry.options.get(CONF_SIGNATURE_TIMESTAMP, 0.0) or 0.0)
+                except Exception:
+                    signature_timestamp = 0.0
+            data = await self.hass.async_add_executor_job(
+                self.client.fetch_all_data, start_date, signature_string, signature_timestamp
+            )
             if not data or not isinstance(data, dict):
                 raise UpdateFailed("电信接口返回空数据")
             return data
@@ -56,11 +90,20 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
         self.phone = phone
         self.entry = entry
         self.client = UnicomClient(phone, auth_data)
+        interval_min = DEFAULT_SCAN_INTERVAL_UNICOM
+        if entry:
+            try:
+                interval_min = int(entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_UNICOM))
+            except Exception:
+                interval_min = DEFAULT_SCAN_INTERVAL_UNICOM
+
+        interval_min = max(MIN_SCAN_INTERVAL, interval_min)
+
         super().__init__(
             hass,
             _LOGGER,
             name=f"China Unicom ({phone})",
-            update_interval=timedelta(seconds=UPDATE_INTERVAL_UNICOM),
+            update_interval=timedelta(minutes=interval_min),
         )
 
     async def _async_update_data(self) -> Dict[str, Any]:

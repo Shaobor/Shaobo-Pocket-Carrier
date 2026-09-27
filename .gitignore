@@ -19,3 +19,8 @@ ha_run/
 *token*.json
 *state*.json
 *result*.json
+_ipa_extract/
+_riskjs/
+__handlers__/
+ctp_binary
+project_progress/

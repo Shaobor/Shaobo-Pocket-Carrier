@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from typing import Any
 import logging
 import random
+import time
+import datetime
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
@@ -17,6 +19,18 @@ from .const import (
     CONF_CARRIER,
     CONF_PHONE,
     CONF_AUTH_DATA,
+    CONF_SCAN_INTERVAL,
+    CONF_CALL_START_DATE,
+    CONF_SIGNATURE_STRING,
+    CONF_SIGNATURE_TIMESTAMP,
+    CONF_AUTH_USER_NAME,
+    CONF_AUTH_ID_CARD,
+    CONF_AUTH_ACTION,
+    AUTH_ACTION_NONE,
+    AUTH_ACTION_CALL_AUTH,
+    MIN_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL_TELECOM,
+    DEFAULT_SCAN_INTERVAL_UNICOM,
 )
 from .api.telecom import TelecomClient, TELECOM_DEVICE_MODELS
 from .api.unicom import UnicomClient
@@ -263,4 +277,221 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
+    @classmethod
+    @callback
+    def async_supports_options_flow(cls, config_entry: config_entries.ConfigEntry) -> bool:
+        """中国电信与中国联通均支持配置选项 (刷新时间等)"""
+        return True
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        """获取集成专属选项流"""
+        return CarrierOptionsFlowHandler(config_entry)
+
+
+class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
+    """运营商集成配置选项流处理类"""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry = None) -> None:
+        """初始化选项流 (支持传入或使用基类自带 property)"""
+        super().__init__()
+        self._custom_config_entry = config_entry
+        self._options_data = {}
+        self._telecom_client = None
+
+    @property
+    def target_entry(self) -> config_entries.ConfigEntry:
+        """获取目标条目"""
+        if self._custom_config_entry is not None:
+            return self._custom_config_entry
+        return self.config_entry
+
+    async def async_step_init(self, user_input=None) -> config_entries.ConfigFlowResult:
+        """管理配置选项 (支持电信/联通自定义刷新时间，电信专属认证入口)"""
+        errors = {}
+        carrier = self.target_entry.data.get(CONF_CARRIER)
+
+        if user_input is not None:
+            # 严格校验：刷新时间最低禁止小于 5 分钟
+            if CONF_SCAN_INTERVAL in user_input:
+                try:
+                    val = float(user_input[CONF_SCAN_INTERVAL])
+                    if val < MIN_SCAN_INTERVAL:
+                        errors["base"] = "interval_too_small"
+                    else:
+                        user_input[CONF_SCAN_INTERVAL] = int(val)
+                except Exception:
+                    errors["base"] = "invalid_interval"
+
+            auth_action = user_input.pop(CONF_AUTH_ACTION, AUTH_ACTION_NONE)
+            if not errors:
+                if carrier == CARRIER_TELECOM:
+                    selected_date = str(user_input.get(CONF_CALL_START_DATE, "") or "").strip()
+                    today_first = datetime.date.today().replace(day=1).strftime("%Y-%m-%d")
+                    # 若用户选择的是当前月的1日或留空，则存为空字符串表示“动态跟随当月”
+                    # 到了新月份 (如10月1日、11月1日) 将完全自动无缝切换，无需用户重复设置
+                    if not selected_date or selected_date == today_first:
+                        user_input[CONF_CALL_START_DATE] = ""
+
+                new_options = dict(self.target_entry.options)
+                new_options.update(user_input)
+                self._options_data = new_options
+
+                # 仅电信支持认证操作流转
+                if auth_action == AUTH_ACTION_CALL_AUTH:
+                    return await self.async_step_telecom_call_auth()
+
+                return self.async_create_entry(title="", data=self._options_data)
+
+        schema_dict = {}
+
+        if carrier == CARRIER_TELECOM:
+            current_interval = int(self.target_entry.options.get(
+                CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_TELECOM
+            ))
+            current_interval = max(MIN_SCAN_INTERVAL, current_interval)
+            schema_dict[
+                vol.Optional(CONF_SCAN_INTERVAL, default=current_interval)
+            ] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=1,
+                    max=1440,
+                    step=1,
+                    unit_of_measurement="分钟",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+
+            first_day_of_month = datetime.date.today().replace(day=1).strftime("%Y-%m-%d")
+            current_start_date = str(self.target_entry.options.get(CONF_CALL_START_DATE, "") or "").strip()
+            if not current_start_date:
+                current_start_date = first_day_of_month
+
+            schema_dict[
+                vol.Optional(CONF_CALL_START_DATE, default=current_start_date)
+            ] = selector.DateSelector()
+
+            # 仅中国电信增加通话详单二次认证选项 (联通不加)
+            schema_dict[
+                vol.Optional(CONF_AUTH_ACTION, default=AUTH_ACTION_NONE)
+            ] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        selector.SelectOptionDict(
+                            value=AUTH_ACTION_NONE,
+                            label="仅保存上述设置 (不执行认证)"
+                        ),
+                        selector.SelectOptionDict(
+                            value=AUTH_ACTION_CALL_AUTH,
+                            label="进行通话流水二次认证 (实名/验证码鉴权)"
+                        ),
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+
+        elif carrier == CARRIER_UNICOM:
+            current_interval = int(self.target_entry.options.get(
+                CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_UNICOM
+            ))
+            current_interval = max(MIN_SCAN_INTERVAL, current_interval)
+            schema_dict[
+                vol.Optional(CONF_SCAN_INTERVAL, default=current_interval)
+            ] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=1,
+                    max=120,
+                    step=1,
+                    unit_of_measurement="分钟",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+            description_placeholders={
+                "carrier": CARRIER_NAMES.get(carrier, "运营商"),
+                "phone": self.target_entry.data.get(CONF_PHONE, ""),
+            },
+        )
+
+    async def async_step_telecom_call_auth(self, user_input=None) -> config_entries.ConfigFlowResult:
+        """电信选项流步骤: 通话详单实名与验证码二次鉴权"""
+        errors = {}
+        phone = self.target_entry.data.get(CONF_PHONE, "")
+        existing_auth = self.target_entry.data.get(CONF_AUTH_DATA) or {}
+        existing_model = existing_auth.get("device_model")
+        if self._telecom_client is None:
+            self._telecom_client = TelecomClient(phone, auth_data=existing_auth, device_model=existing_model)
+
+        coord = None
+        if DOMAIN in self.hass.data and self.target_entry.entry_id in self.hass.data[DOMAIN]:
+            entry_dict = self.hass.data[DOMAIN][self.target_entry.entry_id]
+            if isinstance(entry_dict, dict):
+                coord = entry_dict.get("coordinator")
+            else:
+                coord = entry_dict
+
+        # 1. 机主姓名：优先从本地之前已保存的options中读取；若无则尝试使用电信XML接口实时查出的姓名(排除含*脱敏)
+        default_name = str(self.target_entry.options.get(CONF_AUTH_USER_NAME, "") or "").strip()
+        if not default_name and coord and coord.data:
+            api_name = str(coord.data.get("account_name", "") or "").strip()
+            if api_name and "*" not in api_name:
+                default_name = api_name
+
+        # 2. 身份证号码：仅从本地已保存的options中读取历史记忆，绝不在代码中内置硬编码
+        default_id = str(self.target_entry.options.get(CONF_AUTH_ID_CARD, "") or "").strip()
+
+        if user_input is not None:
+            user_name = user_input.get("user_name", "").strip() or default_name
+            id_card = user_input.get("id_card", "").strip() or default_id
+            sms_code = user_input.get("sms_code", "").strip()
+
+            ok, msg, sig_str = await self.hass.async_add_executor_job(
+                self._telecom_client.verify_detail_auth, user_name, id_card, sms_code
+            )
+            if ok:
+                if sig_str:
+                    self._options_data[CONF_SIGNATURE_STRING] = sig_str
+                self._options_data[CONF_SIGNATURE_TIMESTAMP] = time.time()
+                # 认证成功后，仅在用户输入或确认时缓存在本地 options 中，方便下次免输
+                if user_name:
+                    self._options_data[CONF_AUTH_USER_NAME] = user_name
+                if id_card:
+                    self._options_data[CONF_AUTH_ID_CARD] = id_card
+                if coord:
+                    self.hass.async_create_task(coord.async_request_refresh())
+                return self.async_create_entry(title="", data=self._options_data)
+            else:
+                _LOGGER.warning("电信通话详单认证失败原因: %s", msg)
+                errors["base"] = "call_auth_failed"
+        else:
+            await self.hass.async_add_executor_job(self._telecom_client.send_detail_auth_sms)
+
+        schema_dict = {}
+        if default_name:
+            schema_dict[vol.Optional("user_name", default=default_name)] = selector.TextSelector()
+        else:
+            schema_dict[vol.Optional("user_name")] = selector.TextSelector()
+
+        if default_id:
+            schema_dict[vol.Optional("id_card", default=default_id)] = selector.TextSelector()
+        else:
+            schema_dict[vol.Optional("id_card")] = selector.TextSelector()
+
+        schema_dict[vol.Required("sms_code")] = selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
+        )
+
+        return self.async_show_form(
+            step_id="telecom_call_auth",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+            description_placeholders={"phone": phone},
+        )
 

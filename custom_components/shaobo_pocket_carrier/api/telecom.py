@@ -5,6 +5,8 @@ import os
 import random
 import string
 import time
+import datetime
+import calendar
 import uuid
 import io
 import logging
@@ -99,7 +101,7 @@ class TelecomClient:
         self.key = ""
         self.isct = "0"
         self.sign = None
-
+        self.signature_string = ""
         # 确定设备机型：优先 auth_data 中的持久化机型，其次传入的 device_model，最后回退到默认机型
         self.device_model = DEFAULT_TELECOM_MODEL
         if auth_data and auth_data.get("device_model"):
@@ -173,7 +175,11 @@ class TelecomClient:
         hdr = res.get("headerInfos") or {}
         code_str = str(hdr.get("code") or "")
         reason_str = str(hdr.get("reason") or "")
-        if code_str in ("1001", "2001", "9999") or any(k in reason_str for k in ["token", "失效", "过期", "重新登录", "鉴权失败"]):
+        if (
+            code_str in ("1001", "2001", "9999", "X201", "X110")
+            or any(k in reason_str.lower() for k in ["token", "失效", "过期", "重新登录", "鉴权失败"])
+        ):
+            _LOGGER.warning("电信接口返回登录态失效: code=%s, reason=%s", code_str, reason_str)
             raise CarrierAuthExpiredError(f"电信登录凭证已失效 ({code_str}: {reason_str})")
         return hdr, res.get("responseData") or {}
 
@@ -270,6 +276,126 @@ class TelecomClient:
         _LOGGER.warning("电信短信登录未成功: %s", j.get("resultDesc") or j)
         return False
 
+    def send_detail_auth_sms(self) -> bool:
+        """发送通话详单专属业务短信验证码 (scene 115，短信模板: 您正在中国电信APP查询数据详单业务)"""
+        # 1. 自动完成滑块并获取 signSignatureString
+        sign = ""
+        for attempt in range(5):
+            p2 = {"account": ENC(self.phone), "clientType": "1",
+                  "deviceUid": ENC(self.uid), "scene": "1"}
+            j2 = self._login_post("getSliderVerificationPicture", p2)
+            d = j2.get("data") or {}
+            bg = d.get("backgroundImg") or d.get("bigImg")
+            slider = d.get("sliderImg") or d.get("smallImg")
+            if not bg or not slider or not d.get("key") or not d.get("extra"):
+                continue
+
+            hx, hy, score, pw, bw = locate_notch(bg, slider)
+            dist = hx / (bw - pw)
+            kb = base64.b64decode(d["extra"])
+            st = int(time.time() * 1000)
+            n = 15
+            track = "%".join(f"{(hx * i / n) / (bw - pw):.3f}#0.000#{st + i * 40}"
+                             for i in range(1, n + 1))
+            vp = {
+                "account": ENC(self.phone), "clientType": "1",
+                "deviceUid": ENC(self.uid),
+                "distance": aes_ecb_b64("%.4f" % dist, kb),
+                "endTime": aes_ecb_b64("%d" % (st + 600), kb),
+                "startTime": aes_ecb_b64("%d" % st, kb),
+                "key": d["key"],
+                "scene": "1", "shopId": "20004",
+                "slidingTrack": aes_ecb_b64(track, kb)
+            }
+            j = self._login_post("verificationSliderPicture", vp)
+            sign = (j.get("data") or {}).get("signSignatureString")
+            if sign:
+                break
+            time.sleep(0.5)
+
+        # 2. 调用电信业务验证码端点 https://appgosz.189.cn:443/query/getRandomCodeWithLogin (scene 115)
+        url = "https://appgosz.189.cn:443/query/getRandomCodeWithLogin"
+        ts = time.strftime("%Y%m%d%H%M%S")
+        body = {
+            "headerInfos": {
+                "broadAccount": "", "clientType": self.ct_hdr, "fixedLineToken": "",
+                "userLoginName": ENC(self.phone), "timestamp": ts, "broadToken": "",
+                "fixedLineAccount": "", "provinceCode": self.province_code,
+                "source": "120002", "code": "getRandomCodeWithLogin", "sourcePassword": "TiqmIZ",
+                "token": self.token, "shopId": "20004"
+            },
+            "content": {
+                "fieldData": {
+                    "account": ENC(self.phone),
+                    "deviceUid": self.uid,
+                    "key": "",
+                    "phoneNum": ENC(self.phone),
+                    "salesId": "",
+                    "scene": "115",
+                    "shopId": "20004",
+                    "signSignatureString": sign or "",
+                    "validationCode": "",
+                    "verifyCodeType": ""
+                },
+                "attach": "iPhone"
+            }
+        }
+        try:
+            r = self.s.post(url, json=body, timeout=15)
+            res = r.json()
+            resp_data = res.get("responseData") or {}
+            result_code = str(resp_data.get("resultCode") or "")
+            result_desc = str(resp_data.get("resultDesc") or "")
+            _LOGGER.warning("电信详单业务验证码下发响应: code=%s, desc=%s", result_code, result_desc)
+            return result_code in ("0", "0000") or "成功" in result_desc
+        except Exception as e:
+            _LOGGER.warning("详单验证码下发请求异常: %s", e)
+            return False
+
+    def verify_detail_auth(self, name: str = "", id_card: str = "", sms_code: str = "") -> tuple[bool, str, str]:
+        """提交通话详单二次鉴权认证 (query/authentication)"""
+        if not self.token:
+            return False, "登录凭证缺失，请重新认证电信账号", ""
+
+        clean_name = name.strip()
+        if "*" in clean_name:
+            clean_name = ""
+
+        fd = {
+            "account": ENC(self.phone),
+            "shopId": "20004",
+            "idCardNum": ENC(id_card.strip()) if id_card else "",
+            "userName": ENC(clean_name) if clean_name else "",
+            "randomCode": sms_code.strip(),
+            "scene": "1"
+        }
+        try:
+            hdr, res = self._service_post("query/authentication", "authentication", fd)
+            result_code = str(res.get("resultCode") or hdr.get("code") or "")
+            result_desc = str(res.get("resultDesc") or hdr.get("reason") or "")
+            _LOGGER.warning("电信通话详单二次认证返回: code=%s, desc=%s, res=%s", result_code, result_desc, res)
+            if result_code in ("0", "0000") or "成功" in result_desc:
+                # 动态从接口返回里面提取 signatureString
+                data_dict = res.get("data") or {}
+                sig_str = data_dict.get("signatureString") or res.get("signatureString") or ""
+                if not sig_str and isinstance(res, dict):
+                    # 备用遍历查找含有 signature 的字段
+                    for k, v in res.items():
+                        if "signature" in k.lower() and isinstance(v, str):
+                            sig_str = v
+                            break
+                if not sig_str:
+                    sig_str = f"kf6Hj20004{self.phone}"
+                self.signature_string = sig_str
+                _LOGGER.info("成功从鉴权接口返回中获取到通话详单签名串: %s", sig_str)
+                return True, result_desc or "认证成功", sig_str
+            return False, result_desc or f"认证失败(错误码:{result_code})", ""
+        except CarrierAuthExpiredError:
+            raise
+        except Exception as e:
+            _LOGGER.warning("详单二次认证请求异常: %s", e)
+            return False, str(e), ""
+
     def get_cust_info_xml(self) -> str:
         """调用电信旧版 XML 网关业务码 custInfo，获取机主姓名 (Cust_Name)"""
         if not self.token:
@@ -318,20 +444,27 @@ class TelecomClient:
                     resp = self.s.post(url, data=encrypted.encode("utf-8"), headers=headers, timeout=10)
                     if resp.status_code == 200:
                         text = resp.text
+                        if "<Code>X201</Code>" in text or "token 过期" in text or "token失效" in text or "<Code>X110</Code>" in text:
+                            _LOGGER.warning("电信 XML 网关返回 Token 已失效: %s", text[:200])
+                            raise CarrierAuthExpiredError("电信登录凭证已失效 (XML网关报token过期)")
                         m = re.search(r"<Cust_Name>(.*?)</Cust_Name>", text)
                         if m:
                             name = m.group(1).strip()
                             if name:
                                 _LOGGER.info("成功从电信 XML 网关 (custInfo) 获取到机主真实姓名: %s", name)
                                 return name
+                except CarrierAuthExpiredError:
+                    raise
                 except Exception as ex:
                     _LOGGER.debug("请求 XML 网关 %s 失败: %s", url, ex)
+        except CarrierAuthExpiredError:
+            raise
         except Exception as e:
             _LOGGER.warning("调用电信 custInfo XML 异常: %s", e)
 
         return ""
 
-    def fetch_all_data(self) -> dict:
+    def fetch_all_data(self, start_date: str = "", signature_string: str = "", signature_timestamp: float = 0.0) -> dict:
         """拉取电信全量业务数据"""
         if not self.token:
             raise CarrierAuthExpiredError("电信登录凭据缺失，需要重新认证")
@@ -349,10 +482,30 @@ class TelecomClient:
             _, res_bal = self._service_post("query/queryPhoneBillBalance", "queryPhoneBillBalance", fd_bal)
             bal_data = res_bal.get("data") or {}
             charge_bean = bal_data.get("chargeBean") or {}
+            charge_title = str(charge_bean.get("chargeTitle") or "")
+            is_show_red = str(charge_bean.get("isShowRed") or "")
+            voice_msg = str(bal_data.get("voiceMessage") or "")
+            total_arrears = bal_data.get("totalArrears")
+
+            is_arrears = (
+                "欠费" in charge_title
+                or "欠费" in voice_msg
+                or is_show_red == "1"
+                or (total_arrears is not None and float(total_arrears or 0) > 0)
+            )
+
             try:
-                data_out["balance"] = float(charge_bean.get("charge", 0.0))
+                raw_charge = float(charge_bean.get("charge", 0.0))
             except Exception:
-                data_out["balance"] = 0.0
+                raw_charge = 0.0
+
+            if is_arrears:
+                arr_amt = float(total_arrears) if (total_arrears and float(total_arrears or 0) > 0) else raw_charge
+                data_out["balance"] = -abs(arr_amt)
+                data_out["balance_title"] = charge_title or "当前欠费"
+            else:
+                data_out["balance"] = raw_charge
+                data_out["balance_title"] = charge_title or "当前号码余额"
 
             data_out["balance_general"] = charge_bean.get("charge", "0.00")
             data_out["balance_special"] = "0.00元"
@@ -374,6 +527,8 @@ class TelecomClient:
                 if t_title and t_amt:
                     history_bills[f"{t_title}出账"] = f"{t_amt} 元"
             data_out["history_bills"] = history_bills
+        except CarrierAuthExpiredError:
+            raise
         except Exception as err:
             _LOGGER.warning("拉取电话话费与消费异常: %s", err)
             data_out["balance"] = 0.0
@@ -459,6 +614,8 @@ class TelecomClient:
                         sub_cards.append(mask(p))
             data_out["flow_members"] = flow_members
             data_out["sub_cards"] = sub_cards
+        except CarrierAuthExpiredError:
+            raise
         except Exception as err:
             _LOGGER.warning("拉取电信流量池异常: %s", err)
             data_out["flow_remain_gb"] = 0.0
@@ -524,6 +681,8 @@ class TelecomClient:
                         "used_mins": member_voice[p]
                     })
             data_out["voice_members"] = voice_members
+        except CarrierAuthExpiredError:
+            raise
         except Exception as err:
             _LOGGER.warning("拉取电信通话用量异常: %s", err)
             data_out["package_name"] = "5G畅享套餐"
@@ -576,7 +735,7 @@ class TelecomClient:
             data_out["credit_limit"] = (acc_data.get("phoneConfig") or {}).get("accountDetail", {}).get("creditAvailable", "0")
             vm = acc_data.get("voiceMessage", "")
             data_out["voice_message"] = vm
-            
+
             # 从电信语音欢迎词中纯动态正则提取真实网龄 (如: 您网龄为一十年六个月)
             m_age = re.search(r"网龄为([^，,。]+)", vm)
             data_out["open_years"] = m_age.group(1) if m_age else "在网用户"
@@ -599,9 +758,179 @@ class TelecomClient:
             cust_name = self.get_cust_info_xml()
             if cust_name:
                 data_out["account_name"] = cust_name
+        except CarrierAuthExpiredError:
+            raise
         except Exception as err:
             _LOGGER.warning("获取电信机主姓名(Cust_Name)异常: %s", err)
+
+        # 8. 通话记录与语音详单 (queryDetailsV2)
+        # 二次认证成功后有效期为 30 分钟 (1800 秒)，30 分钟后自动失效，实体进入需重新认证状态
+        today = datetime.date.today()
+        query_year = today.year
+        query_month = today.month
+        start_day = 1
+
+        if start_date:
+            s = str(start_date).strip()
+            # 兼容正则匹配: 2026-08-01, 2026/8/1, 2026.8.1, 2026-08 等
+            m_date = re.match(r"^(\d{4})[-/.]?(\d{1,2})(?:[-/.]?(\d{1,2}))?$", s)
+            if m_date:
+                query_year = int(m_date.group(1))
+                query_month = int(m_date.group(2))
+                start_day = int(m_date.group(3)) if m_date.group(3) else 1
+            else:
+                digits = re.sub(r"\D", "", s)
+                if len(digits) >= 6:
+                    try:
+                        query_year = int(digits[:4])
+                        query_month = int(digits[4:6])
+                        start_day = int(digits[6:8]) if len(digits) >= 8 else 1
+                    except Exception:
+                        pass
+
+        if not (1 <= query_month <= 12):
+            query_year = today.year
+            query_month = today.month
+            start_day = 1
+
+        clean_start_date = f"{query_year:04d}{query_month:02d}{start_day:02d}"
+
+        # 电信详单按自然月查询：若是当月查至当天，若是历史月份则自动查至该月最后一天
+        if query_year == today.year and query_month == today.month:
+            end_date_str = today.strftime("%Y%m%d")
+        else:
+            _, last_day = calendar.monthrange(query_year, query_month)
+            end_date_str = f"{query_year:04d}{query_month:02d}{last_day:02d}"
+
+        display_start_date = f"{clean_start_date[:4]}-{clean_start_date[4:6]}-{clean_start_date[6:8]}"
+        display_end_date = f"{end_date_str[:4]}-{end_date_str[4:6]}-{end_date_str[6:8]}"
+
+        passed_seconds = 0.0
+        is_expired = False
+        remaining_minutes = 0
+        if signature_timestamp > 0:
+            passed_seconds = time.time() - signature_timestamp
+            if passed_seconds >= 1800:
+                is_expired = True
+                _LOGGER.info("电信通话详单二次鉴权已满30分钟(已过 %.1f 秒)，自动失效", passed_seconds)
+            else:
+                remaining_minutes = max(1, int((1800 - passed_seconds) // 60))
+
+        auto_signature = signature_string or getattr(self, "signature_string", "")
+        # 如果未提供签名，或者已超过30分钟有效期
+        if not auto_signature or is_expired:
+            data_out["call_records"] = []
+            data_out["call_count"] = 0
+            data_out["last_call"] = {}
+            data_out["call_need_auth"] = True
+            data_out["call_auth_status"] = "已过期 (需重新认证)" if is_expired else "未认证 (需二次认证)"
+            data_out["call_auth_remaining_minutes"] = 0
+            data_out["call_start_date"] = display_start_date
+            data_out["call_end_date"] = display_end_date
+        else:
+            try:
+                fd_call = {
+                    "account": ENC(self.phone),
+                    "queryFlag": "1",
+                    "isChinatelecom": "1",
+                    "type": "1",            # 1=语音详单
+                    "startDate": clean_start_date,  # 单月查询起始日期 (YYYYMMDD)
+                    "endDate": end_date_str,        # 当月截止当天或历史月截止最后一天 (YYYYMMDD)
+                    "shopId": "20004",
+                    "phoneType": "69",      # Hook实测必填字段
+                    "provinceCode": self.province_code,
+                    "cityCode": self.city_code,
+                    "sortId": "",
+                    "validateType": "1",    # Hook实测: 1而非 0
+                    "filterConditions": "",
+                    "signatureString": auto_signature,
+                    "accessAuth": "0"
+                }
+                _, res_call = self._service_post("query/queryDetailsV2", "queryDetailsV2", fd_call)
+                resp_data = res_call.get("data") or {}
+                v_detail = resp_data.get("voiceDetail") or {}
+                v_list = v_detail.get("voiceDetailList") or []
+
+                def _decrypt_calle_no(raw: str) -> str:
+                    if not raw or not isinstance(raw, str):
+                        return ""
+                    # 电信 App 逆向算法 ASCIIDencrypt: 每一位字符 ASCII 码减 2
+                    try:
+                        return "".join(chr(ord(c) - 2) for c in raw)
+                    except Exception:
+                        return raw
+
+                def _map_call_type(raw_type: str) -> str:
+                    if not raw_type:
+                        return "呼叫"
+                    if "主叫" in raw_type or raw_type == "1":
+                        return "呼叫"
+                    if "被叫" in raw_type or raw_type == "2":
+                        return "接听"
+                    return raw_type
+
+                def _format_call_time(raw: str, default_year: int) -> str:
+                    if not raw or not isinstance(raw, str):
+                        return ""
+                    raw_str = raw.strip()
+                    # 匹配类似: "9月26日 17:00:22", "09月26日 17:00:22", "2026-09-26 17:00:22", "09-26 17:00:22"
+                    m = re.search(r"(?:(\d{4})[年/-])?(\d{1,2})[月/-](\d{1,2})[日]?\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?", raw_str)
+                    if m:
+                        y = int(m.group(1)) if m.group(1) else default_year
+                        mo = int(m.group(2))
+                        d = int(m.group(3))
+                        h = int(m.group(4))
+                        mi = int(m.group(5))
+                        s = int(m.group(6)) if m.group(6) is not None else 0
+                        return f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}"
+                    return raw_str
+
+                call_records = []
+                for item in v_list:
+                    call_records.append({
+                        "calle_no": _decrypt_calle_no(item.get("calleNo", "")),
+                        "call_type": item.get("callType", ""),
+                        "call_time": _format_call_time(item.get("callTime", ""), query_year),
+                        "duration": item.get("duration", ""),
+                        "call_area": item.get("callArea", ""),
+                        "type": _map_call_type(item.get("type", "")),  # 呼叫/接听
+                        "total_charge": item.get("totalCharge", "0元")
+                    })
+
+                result_code = str(res_call.get("resultCode") or "")
+                result_desc = str(res_call.get("resultDesc") or "")
+
+                # 检查接口返回是否指示鉴权失效 (如1009/1010/非0或错误码且无数据)
+                if (result_code in ("1009", "1010") or result_code not in ("0", "0000")) and not call_records:
+                    data_out["call_records"] = []
+                    data_out["call_count"] = 0
+                    data_out["last_call"] = {}
+                    data_out["call_need_auth"] = True
+                    data_out["call_auth_status"] = "详单授权已过期 (需重新认证)"
+                    data_out["call_auth_remaining_minutes"] = 0
+                else:
+                    data_out["call_records"] = call_records
+                    data_out["call_count"] = len(call_records)
+                    data_out["last_call"] = call_records[0] if call_records else {}
+                    data_out["call_need_auth"] = False
+                    data_out["call_auth_status"] = f"有效 (约剩余 {remaining_minutes} 分钟)" if remaining_minutes else "有效"
+                    data_out["call_auth_remaining_minutes"] = remaining_minutes
+
+                data_out["call_start_date"] = display_start_date
+                data_out["call_end_date"] = display_end_date
+                _LOGGER.debug("电信通话记录拉取: %d 条 (时间区间: %s -> %s, 授权状态: %s)", len(call_records), display_start_date, display_end_date, data_out["call_auth_status"])
+            except Exception as err:
+                _LOGGER.debug("拉取电信通话记录异常: %s", err)
+                data_out["call_records"] = []
+                data_out["call_count"] = 0
+                data_out["last_call"] = {}
+                data_out["call_need_auth"] = True
+                data_out["call_auth_status"] = "已过期 (需重新认证)"
+                data_out["call_auth_remaining_minutes"] = 0
+                data_out["call_start_date"] = display_start_date
+                data_out["call_end_date"] = display_end_date
 
         data_out["location"] = f"{self.province_name} {self.city_name}".strip() or "中国电信"
         data_out["account_status"] = "正常"
         return data_out
+

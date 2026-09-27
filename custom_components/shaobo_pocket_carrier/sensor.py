@@ -25,7 +25,7 @@ async def async_setup_entry(
     sensors = []
     if carrier == CARRIER_TELECOM:
         _LOGGER.debug("正在为电信手机号 %s 注册专属传感器模块", phone)
-        sensors = get_telecom_sensors(coordinator, phone)
+        sensors = get_telecom_sensors(coordinator, phone, entry=entry)
     elif carrier == CARRIER_UNICOM:
         _LOGGER.debug("正在为联通手机号 %s 注册专属传感器模块", phone)
         sensors = get_unicom_sensors(coordinator, phone)
