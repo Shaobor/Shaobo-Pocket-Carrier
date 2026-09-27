@@ -469,7 +469,7 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
     def extra_state_attributes(self) -> Dict[str, Any]:
         records = self.data.get("call_records") or []
         masked_list = []
-        for r in records[:30]:
+        for r in records:
             call_type = r.get("type", "")
             if "主叫" in call_type:
                 call_type = "呼叫"
