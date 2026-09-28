@@ -795,12 +795,11 @@ class TelecomClient:
 
         clean_start_date = f"{query_year:04d}{query_month:02d}{start_day:02d}"
 
-        # 电信详单按自然月查询：若是当月查至当天，若是历史月份则自动查至该月最后一天
-        if query_year == today.year and query_month == today.month:
-            end_date_str = today.strftime("%Y%m%d")
-        else:
-            _, last_day = calendar.monthrange(query_year, query_month)
-            end_date_str = f"{query_year:04d}{query_month:02d}{last_day:02d}"
+        # 电信详单按自然月查询 (跨月区间会返回空): 用户只需给出起始日期/月份，
+        # 截止日期一律自动取该月最后一天。接口对当月未来日期同样接受，
+        # 只会返回截止当前时刻为止已产生的流水，因此当月也能安全用月末日期。
+        _, last_day = calendar.monthrange(query_year, query_month)
+        end_date_str = f"{query_year:04d}{query_month:02d}{last_day:02d}"
 
         display_start_date = f"{clean_start_date[:4]}-{clean_start_date[4:6]}-{clean_start_date[6:8]}"
         display_end_date = f"{end_date_str[:4]}-{end_date_str[4:6]}-{end_date_str[6:8]}"
