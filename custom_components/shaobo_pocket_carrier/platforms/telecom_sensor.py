@@ -440,8 +440,7 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
 
     @property
     def native_value(self) -> str:
-        if self.data.get("call_need_auth"):
-            return "详单授权已过期 (需重新认证)"
+        # 授权过期时若本地缓存有流水，仍然展示最近一次通话，避免数据凭空消失
         last = self.data.get("last_call") or {}
         if last.get("call_time"):
             target = last.get("calle_no", "未知")
@@ -451,10 +450,14 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
             elif "被叫" in call_dir:
                 call_dir = "接听"
             return f"{call_dir} {target} ({last.get('duration', '')})"
+        if self.data.get("call_need_auth"):
+            return "详单授权已过期 (需重新认证)"
         return "本月暂无通话"
 
     @property
     def icon(self) -> str:
+        if self.data.get("call_data_from_cache"):
+            return "mdi:database-clock-outline"
         if self.data.get("call_need_auth"):
             return "mdi:shield-lock-outline"
         last = self.data.get("last_call") or {}
@@ -487,6 +490,14 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
         auth_status = self.data.get("call_auth_status") or ("已过期 (需重新认证)" if self.data.get("call_need_auth") else "有效")
         rem_min = self.data.get("call_auth_remaining_minutes", 0)
 
+        # 数据来源: 实时接口 / 本地缓存兜底
+        from_cache = bool(self.data.get("call_data_from_cache"))
+        if from_cache:
+            cache_saved_at = str(self.data.get("call_cache_saved_at_text") or "").strip()
+            data_source = f"本地缓存 (缓存于 {cache_saved_at})" if cache_saved_at else "本地缓存"
+        else:
+            data_source = "实时接口"
+
         last = self.data.get("last_call") or {}
         last_formatted = {}
         if last.get("call_time"):
@@ -505,13 +516,17 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
                 "fee": last.get("total_charge", "0元"),
             }
 
-        return {
+        attrs = {
             "运营商": "中国电信",
+            "数据来源": data_source,
             "本月通话次数": self.data.get("call_count", len(records)),
             "查询起始日期": self.data.get("call_start_date", "当月月初"),
-            "查询截至日期": self.data.get("call_end_date", "当天"),
+            "查询截至日期": self.data.get("call_end_date", "该月最后一天"),
             "详单授权状态": auth_status,
             "授权剩余有效时长": f"{rem_min} 分钟" if not self.data.get("call_need_auth") else "0 分钟",
             "最近一次通话": last_formatted,
             "通话流水清单": masked_list,
         }
+        if from_cache:
+            attrs["缓存说明"] = "详单二次认证已过期，当前展示本地缓存的历史流水；重新认证后可拉取最新数据"
+        return attrs
