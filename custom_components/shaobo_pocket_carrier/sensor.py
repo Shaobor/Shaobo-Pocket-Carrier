@@ -6,6 +6,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, CARRIER_TELECOM, CARRIER_UNICOM, CONF_CARRIER, CONF_PHONE
+from .platforms.overview import create_overview_sensor
 from .platforms.telecom_sensor import get_telecom_sensors
 from .platforms.unicom_sensor import get_unicom_sensors
 
@@ -33,5 +34,8 @@ async def async_setup_entry(
         _LOGGER.error("未知的运营商类型: %s", carrier)
 
     if sensors:
+        # 追加「数据总览」实体: 把该手机号下所有传感器的状态与属性聚合到一个实体的属性上
+        # (每个传感器一个节点), 源实体全部保留, 不影响既有引用与长期统计
+        sensors.append(create_overview_sensor(hass, coordinator, carrier, phone, entry))
         async_add_entities(sensors, update_before_add=False)
 

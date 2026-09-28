@@ -5,7 +5,21 @@ from homeassistant.components.sensor import SensorEntity, SensorEntityDescriptio
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import DeviceInfo
 
-from ..const import DOMAIN, CARRIER_NAMES
+from ..const import DOMAIN, CARRIER_NAMES, CARRIER_TELECOM
+
+
+def build_device_info(carrier: str, phone: str) -> DeviceInfo:
+    """构建手机号在 Home Assistant 中的独立设备信息 (所有平台实体共用)"""
+    carrier_name = CARRIER_NAMES.get(carrier, carrier)
+    return DeviceInfo(
+        identifiers={(DOMAIN, f"{carrier}_{phone}")},
+        name=f"{carrier_name} ({phone})",
+        manufacturer="Shaobor",
+        model=f"{carrier_name}通信账户",
+        sw_version="13.4" if carrier == CARRIER_TELECOM else "13.1",
+        configuration_url="https://appgologinsz.189.cn" if carrier == CARRIER_TELECOM else "https://m.client.10010.com",
+    )
+
 
 class BaseCarrierSensor(CoordinatorEntity, SensorEntity):
     """运营商传感器基类，自动处理设备归属与通用属性"""
@@ -29,16 +43,7 @@ class BaseCarrierSensor(CoordinatorEntity, SensorEntity):
         self._attr_unique_id = f"{DOMAIN}_{carrier}_{phone}_{description.key}"
         
         # 每一个手机号在 HA 中作为一个完全独立的独立设备（Device）
-        carrier_name = CARRIER_NAMES.get(carrier, carrier)
-        
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{carrier}_{phone}")},
-            name=f"{carrier_name} ({phone})",
-            manufacturer="Shaobor",
-            model=f"{carrier_name}通信账户",
-            sw_version="13.4" if carrier == "telecom" else "13.1",
-            configuration_url="https://appgologinsz.189.cn" if carrier == "telecom" else "https://m.client.10010.com",
-        )
+        self._attr_device_info = build_device_info(carrier, phone)
 
     @property
     def data(self) -> Dict[str, Any]:
