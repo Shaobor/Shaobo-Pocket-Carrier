@@ -22,6 +22,20 @@ from ..const import CarrierAuthExpiredError
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def enrich_call_records(records) -> None:
+    """用本地 phone2region 归属地库补充 number_location / number_isp
+
+    归属地只是附加信息: 库缺失、损坏或解析异常时静默跳过，绝不影响通话记录本体。
+    """
+    try:
+        from ..phone_region import enrich_records, get_index
+
+        enrich_records(get_index(), records)
+    except Exception as err:
+        _LOGGER.debug("补充号码归属地失败(已跳过): %s", err)
+
+
 HOST = "https://appgologinsz.189.cn"
 SERVICE_HOST = "https://appfuwuhd.189.cn:443"
 DEFAULT_TELECOM_MODEL = "iPhone 11 Pro Max"
@@ -175,13 +189,40 @@ class TelecomClient:
         hdr = res.get("headerInfos") or {}
         code_str = str(hdr.get("code") or "")
         reason_str = str(hdr.get("reason") or "")
-        if (
-            code_str in ("1001", "2001", "9999", "X201", "X110")
-            or any(k in reason_str.lower() for k in ["token", "失效", "过期", "重新登录", "鉴权失败"])
+        # 仅当明确是"登录态/鉴权"问题才算登录失效。
+        # 注意: 不能只按中文关键词"过期/失效"判定 —— 详单授权等业务性提示同样会带这两个词，
+        # 误判会导致整条配置条目进入 setup 失败、所有实体被卸载。
+        if code_str in ("1001", "2001", "9999", "X201", "X110") or any(
+            k in reason_str.lower()
+            for k in ["token", "重新登录", "鉴权失败", "未登录", "登录已失效", "凭证", "会话"]
         ):
             _LOGGER.warning("电信接口返回登录态失效: code=%s, reason=%s", code_str, reason_str)
             raise CarrierAuthExpiredError(f"电信登录凭证已失效 ({code_str}: {reason_str})")
         return hdr, res.get("responseData") or {}
+
+    def probe_token(self) -> str:
+        """轻量探活: 判断当前登录态是否仍然有效 (用于"掉线即自动短信登录")
+
+        返回值:
+        - "ok"      : 登录凭证有效
+        - "expired" : 登录凭证已失效, 需要重新登录
+        - "error"   : 网络/接口异常, 无法据此判定掉线 (不应触发登录短信)
+        """
+        if not self.token:
+            return "expired"
+        fd = {
+            "account": ENC(self.phone), "queryFlag": "1", "provinceCode": self.province_code,
+            "cityCode": self.city_code, "shopId": "20004", "accessAuth": "0",
+            "developCode": "", "isChinatelecom": "1", "netType": ""
+        }
+        try:
+            self._service_post("query/queryPhoneBillBalance", "queryPhoneBillBalance", fd)
+            return "ok"
+        except CarrierAuthExpiredError:
+            return "expired"
+        except Exception as err:
+            _LOGGER.debug("电信登录态探活请求异常(视为网络问题): %s", err)
+            return "error"
 
     def send_sms(self) -> bool:
         """全自动识别滑块并秒级下发电信短信验证码"""
@@ -795,12 +836,11 @@ class TelecomClient:
 
         clean_start_date = f"{query_year:04d}{query_month:02d}{start_day:02d}"
 
-        # 电信详单按自然月查询：若是当月查至当天，若是历史月份则自动查至该月最后一天
-        if query_year == today.year and query_month == today.month:
-            end_date_str = today.strftime("%Y%m%d")
-        else:
-            _, last_day = calendar.monthrange(query_year, query_month)
-            end_date_str = f"{query_year:04d}{query_month:02d}{last_day:02d}"
+        # 电信详单按自然月查询 (跨月区间会返回空): 用户只需给出起始日期/月份，
+        # 截止日期一律自动取该月最后一天。接口对当月未来日期同样接受，
+        # 只会返回截止当前时刻为止已产生的流水，因此当月也能安全用月末日期。
+        _, last_day = calendar.monthrange(query_year, query_month)
+        end_date_str = f"{query_year:04d}{query_month:02d}{last_day:02d}"
 
         display_start_date = f"{clean_start_date[:4]}-{clean_start_date[4:6]}-{clean_start_date[6:8]}"
         display_end_date = f"{end_date_str[:4]}-{end_date_str[4:6]}-{end_date_str[6:8]}"
@@ -887,15 +927,23 @@ class TelecomClient:
 
                 call_records = []
                 for item in v_list:
+                    # 字段顺序与本地缓存/实体属性输出保持一致 (见 phone_region.RECORD_FIELDS)
                     call_records.append({
-                        "calle_no": _decrypt_calle_no(item.get("calleNo", "")),
-                        "call_type": item.get("callType", ""),
                         "call_time": _format_call_time(item.get("callTime", ""), query_year),
+                        "type": _map_call_type(item.get("type", "")),   # 呼叫/接听
+                        "call_type": item.get("callType", ""),          # 国内通话/漫游
+                        "phone_number": _decrypt_calle_no(item.get("calleNo", "")),
                         "duration": item.get("duration", ""),
-                        "call_area": item.get("callArea", ""),
-                        "type": _map_call_type(item.get("type", "")),  # 呼叫/接听
-                        "total_charge": item.get("totalCharge", "0元")
+                        "location": item.get("callArea", ""),           # 通话地(本机所在地)
+                        "location_coordinate": "",                      # 通话地坐标(本地地图数据)
+                        "number_location": "",                          # 对方号码归属地(本地库查询)
+                        "number_isp": "",                               # 对方运营商(本地库查询)
+                        "number_location_coordinate": "",               # 对方归属地坐标(本地地图数据)
+                        "fee": item.get("totalCharge", "0元"),
                     })
+
+                # 用本地归属地库补充对方号码归属地/运营商 (库缺失/损坏时保持为空)
+                enrich_call_records(call_records)
 
                 result_code = str(res_call.get("resultCode") or "")
                 result_desc = str(res_call.get("resultDesc") or "")

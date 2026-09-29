@@ -25,6 +25,8 @@ from .const import (
     CONF_SIGNATURE_TIMESTAMP,
     CONF_AUTH_USER_NAME,
     CONF_AUTH_ID_CARD,
+    CONF_OVERVIEW_CALL_LIMIT,
+    OVERVIEW_CALL_LIMIT_DEFAULT,
     CONF_AUTH_ACTION,
     AUTH_ACTION_NONE,
     AUTH_ACTION_CALL_AUTH,
@@ -326,6 +328,15 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                 except Exception:
                     errors["base"] = "invalid_interval"
 
+            # 数据总览实体保留的通话流水条数 (0 = 全部)
+            if CONF_OVERVIEW_CALL_LIMIT in user_input:
+                try:
+                    user_input[CONF_OVERVIEW_CALL_LIMIT] = max(
+                        0, int(float(user_input[CONF_OVERVIEW_CALL_LIMIT] or 0))
+                    )
+                except Exception:
+                    user_input[CONF_OVERVIEW_CALL_LIMIT] = OVERVIEW_CALL_LIMIT_DEFAULT
+
             auth_action = user_input.pop(CONF_AUTH_ACTION, AUTH_ACTION_NONE)
             if not errors:
                 if carrier == CARRIER_TELECOM:
@@ -410,6 +421,28 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                 )
             )
 
+        # 通用选项: 数据总览实体里保留的通话流水条数 (0 = 全部保留)
+        try:
+            current_limit = int(
+                self.target_entry.options.get(
+                    CONF_OVERVIEW_CALL_LIMIT, OVERVIEW_CALL_LIMIT_DEFAULT
+                )
+                or 0
+            )
+        except Exception:
+            current_limit = OVERVIEW_CALL_LIMIT_DEFAULT
+        schema_dict[
+            vol.Optional(CONF_OVERVIEW_CALL_LIMIT, default=current_limit)
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0,
+                max=5000,
+                step=1,
+                unit_of_measurement="条",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        )
+
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(schema_dict),
@@ -419,6 +452,7 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                 "phone": self.target_entry.data.get(CONF_PHONE, ""),
             },
         )
+
 
     async def async_step_telecom_call_auth(self, user_input=None) -> config_entries.ConfigFlowResult:
         """电信选项流步骤: 通话详单实名与验证码二次鉴权"""
@@ -464,13 +498,23 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                     self._options_data[CONF_AUTH_USER_NAME] = user_name
                 if id_card:
                     self._options_data[CONF_AUTH_ID_CARD] = id_card
-                if coord:
-                    self.hass.async_create_task(coord.async_request_refresh())
+                # 选项写入后由 __init__.async_update_options 立即触发一次数据刷新
+                # (签名等运行时选项不再触发整条重载，注意不要在此处提前刷新，
+                #  否则可能读到尚未落盘的旧签名，导致通话流水仍显示"需重新认证")
                 return self.async_create_entry(title="", data=self._options_data)
             else:
                 _LOGGER.warning("电信通话详单认证失败原因: %s", msg)
                 errors["base"] = "call_auth_failed"
         else:
+            # 选项流自行下发验证码前，先取消实体侧「验证码写入即自动提交」的等待窗口，
+            # 避免「通话详单验证码」实体抢先消费掉本次验证码 (两个入口互相打架)
+            try:
+                from .platforms.auth_runtime import async_cancel_call_auth_auto_submit
+
+                async_cancel_call_auth_auto_submit(self.hass, self.target_entry)
+            except Exception as err:
+                _LOGGER.debug("取消实体侧自动提交等待窗口失败: %s", err)
+
             await self.hass.async_add_executor_job(self._telecom_client.send_detail_auth_sms)
 
         schema_dict = {}
