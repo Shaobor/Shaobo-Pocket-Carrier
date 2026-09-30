@@ -7,7 +7,32 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 
-from .base import BaseCarrierSensor
+from .base import BaseCarrierSensor, BaseOnlineSensor
+from ..phone_region import db_status as _region_db_status, normalize_record
+
+
+def _city_geo_text() -> str:
+    """城市坐标表状态文本 (供实体属性展示)"""
+    try:
+        from ..city_geo import status as _status
+
+        info = _status()
+    except Exception as err:
+        return f"不可用 ({err})"
+    if not info.get("cities"):
+        return "不可用 (坐标表缺失)"
+    return f"{info.get('cities')} 个城市坐标（\"经度,纬度\" 字符串）"
+
+
+def _region_db_text() -> str:
+    """归属地库状态文本 (库不可用时如实说明, 不影响其它数据)"""
+    try:
+        status = _region_db_status()
+    except Exception as err:
+        return f"不可用 ({err})"
+    if not status.get("available"):
+        return "不可用 (库文件缺失或损坏)"
+    return f"{status.get('version')} ({status.get('source')})"
 from ..const import (
     CARRIER_TELECOM,
     SENSOR_PHONE,
@@ -358,11 +383,16 @@ class TelecomAccountSensor(BaseCarrierSensor):
 
     @property
     def native_value(self) -> str:
+        # 登录失效时不要按旧余额算出"正常"，否则会与「在线状态=离线」自相矛盾
+        if self.data.get("login_expired"):
+            return "登录已失效 (需重新登录)"
         bal = self.data.get("balance", 0.0)
         return "欠费" if (bal or 0.0) < 0 else "正常"
 
     @property
     def icon(self) -> str:
+        if self.data.get("login_expired"):
+            return "mdi:account-off"
         bal = self.data.get("balance", 0.0)
         return "mdi:account-alert" if (bal or 0.0) < 0 else "mdi:account-check"
 
@@ -422,9 +452,17 @@ def get_telecom_sensors(coordinator, phone: str, entry=None) -> List[BaseCarrier
         TelecomIntegralSensor(coordinator, phone),
         TelecomLocationSensor(coordinator, phone),
         TelecomAccountSensor(coordinator, phone),
+        TelecomOnlineSensor(coordinator, phone),
         TelecomLastUpdateSensor(coordinator, phone),
         TelecomCallRecordSensor(coordinator, phone),
     ]
+
+
+class TelecomOnlineSensor(BaseOnlineSensor):
+    """电信账号在线状态 (在线/离线/未知)，会作为节点合并进「数据总览」实体"""
+
+    def __init__(self, coordinator, phone: str):
+        super().__init__(coordinator, CARRIER_TELECOM, phone)
 
 
 class TelecomCallRecordSensor(BaseCarrierSensor):
@@ -443,12 +481,8 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
         # 授权过期时若本地缓存有流水，仍然展示最近一次通话，避免数据凭空消失
         last = self.data.get("last_call") or {}
         if last.get("call_time"):
-            target = last.get("calle_no", "未知")
-            call_dir = last.get("type", "")
-            if "主叫" in call_dir:
-                call_dir = "呼叫"
-            elif "被叫" in call_dir:
-                call_dir = "接听"
+            target = last.get("phone_number") or last.get("calle_no") or "未知"
+            call_dir = normalize_record(last).get("type", "")
             return f"{call_dir} {target} ({last.get('duration', '')})"
         if self.data.get("call_need_auth"):
             return "详单授权已过期 (需重新认证)"
@@ -471,22 +505,8 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         records = self.data.get("call_records") or []
-        masked_list = []
-        for r in records:
-            call_type = r.get("type", "")
-            if "主叫" in call_type:
-                call_type = "呼叫"
-            elif "被叫" in call_type:
-                call_type = "接听"
-            masked_list.append({
-                "call_time": r.get("call_time", ""),
-                "type": call_type,                   # 呼叫/接听
-                "call_type": r.get("call_type", ""),  # 国内通话/漫游
-                "phone_number": r.get("calle_no", ""),
-                "duration": r.get("duration", ""),
-                "location": r.get("call_area", ""),
-                "fee": r.get("total_charge", "0元"),
-            })
+        # 统一字段结构 (兼容旧缓存键名并补齐归属地/运营商)
+        masked_list = [normalize_record(r) for r in records if isinstance(r, dict)]
         auth_status = self.data.get("call_auth_status") or ("已过期 (需重新认证)" if self.data.get("call_need_auth") else "有效")
         rem_min = self.data.get("call_auth_remaining_minutes", 0)
 
@@ -499,26 +519,17 @@ class TelecomCallRecordSensor(BaseCarrierSensor):
             data_source = "实时接口"
 
         last = self.data.get("last_call") or {}
-        last_formatted = {}
-        if last.get("call_time"):
-            last_type = last.get("type", "")
-            if "主叫" in last_type:
-                last_type = "呼叫"
-            elif "被叫" in last_type:
-                last_type = "接听"
-            last_formatted = {
-                "call_time": last.get("call_time", ""),
-                "type": last_type,
-                "call_type": last.get("call_type", ""),
-                "phone_number": last.get("calle_no", ""),
-                "duration": last.get("duration", ""),
-                "location": last.get("call_area", ""),
-                "fee": last.get("total_charge", "0元"),
-            }
+        last_formatted = (
+            normalize_record(last)
+            if isinstance(last, dict) and last.get("call_time")
+            else {}
+        )
 
         attrs = {
             "运营商": "中国电信",
             "数据来源": data_source,
+            "归属地库": _region_db_text(),
+            "坐标库": _city_geo_text(),
             "本月通话次数": self.data.get("call_count", len(records)),
             "查询起始日期": self.data.get("call_start_date", "当月月初"),
             "查询截至日期": self.data.get("call_end_date", "该月最后一天"),
