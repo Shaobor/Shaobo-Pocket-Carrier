@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """中国电信专属传感器模块 (独立隔离，全量对齐高标准属性与 12 核心实体)"""
+import re
 import time
 from typing import Any, Dict, List, Optional
 from homeassistant.components.sensor import (
@@ -8,7 +9,14 @@ from homeassistant.components.sensor import (
 )
 
 from .base import BaseCarrierSensor, BaseOnlineSensor
-from ..phone_region import db_status as _region_db_status, normalize_record
+from ..phone_region import (
+    db_status as _region_db_status,
+    normalize_net_daily,
+    normalize_net_record,
+    normalize_record,
+    normalize_sms_daily,
+    normalize_sms_record,
+)
 
 
 def _city_geo_text() -> str:
@@ -45,6 +53,8 @@ from ..const import (
     SENSOR_VOICE_REMAIN,
     SENSOR_VOICE_USED,
     SENSOR_CALL_RECORD,
+    SENSOR_SMS_RECORD,
+    SENSOR_NET_RECORD,
     SENSOR_INTEGRAL,
     SENSOR_LOCATION,
     SENSOR_ACCOUNT_STATUS,
@@ -438,6 +448,252 @@ class TelecomLastUpdateSensor(BaseCarrierSensor):
         }
 
 
+# =====================================================================
+# 详单类传感器 (短信 / 上网流量)
+#
+# 三类详单(语音/短信/上网)共用同一个接口与同一次二次认证、同一个查询区间，
+# 因此授权状态、数据来源、缓存兜底逻辑完全一致，差别只在清单结构与摘要。
+# 摘要放状态、清单 + 按天汇总 + 合计放属性 (属性过大时 HA 不入库，实时读取不受影响)。
+# =====================================================================
+class _DetailRecordSensor(BaseCarrierSensor):
+    """详单传感器公共实现"""
+
+    _prefix = "sms"                 # 数据字典前缀 (sms_ / net_)
+    _label = "短信"                 # 摘要里的名称
+    _list_attr = "短信记录"          # 明细清单属性名
+    _daily_attr = "按天汇总"
+    _idle_icon = "mdi:file-document-outline"
+
+    # ---------------- 子类实现 ----------------
+    def _normalize_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def _normalize_daily(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def _summary(self) -> str:
+        raise NotImplementedError
+
+    def _extra_detail_attrs(self) -> Dict[str, Any]:
+        return {}
+
+    # ---------------- 公共数据 ----------------
+    @property
+    def _records(self) -> List[Dict[str, Any]]:
+        raw = self.data.get(f"{self._prefix}_records") or []
+        return [self._normalize_record(r) for r in raw if isinstance(r, dict)]
+
+    @property
+    def _daily(self) -> List[Dict[str, Any]]:
+        raw = self.data.get(f"{self._prefix}_daily") or []
+        return [self._normalize_daily(r) for r in raw if isinstance(r, dict)]
+
+    @property
+    def _total(self) -> Dict[str, Any]:
+        total = self.data.get(f"{self._prefix}_total")
+        return total if isinstance(total, dict) else {}
+
+    def _month_text(self, full: bool = False) -> str:
+        """查询区间所属月份: "2026-09-01" -> "9月" / "2026年9月" """
+        start = str(
+            self.data.get(f"{self._prefix}_start_date")
+            or self.data.get("call_start_date")
+            or ""
+        )
+        matched = re.match(r"^(\d{4})-(\d{2})", start)
+        if not matched:
+            return "本月"
+        if full:
+            return f"{matched.group(1)}年{int(matched.group(2))}月"
+        return f"{int(matched.group(2))}月"
+
+    @property
+    def _auth_status(self) -> str:
+        return str(
+            self.data.get(f"{self._prefix}_status")
+            or self.data.get("call_auth_status")
+            or "未知"
+        )
+
+    # ---------------- 实体状态 ----------------
+    @property
+    def native_value(self) -> str:
+        if self._records:
+            return self._summary()
+        if self.data.get("call_need_auth"):
+            return "详单授权已过期 (需重新认证)"
+        return f"{self._month_text()}无{self._label}记录"
+
+    @property
+    def icon(self) -> str:
+        if self.data.get(f"{self._prefix}_data_from_cache"):
+            return "mdi:database-clock-outline"
+        if self.data.get("call_need_auth"):
+            return "mdi:shield-lock-outline"
+        return self._idle_icon
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        records = self._records
+        total = self._total
+        rem_min = self.data.get("call_auth_remaining_minutes", 0)
+        from_cache = bool(self.data.get(f"{self._prefix}_data_from_cache"))
+        if from_cache:
+            saved_at = str(self.data.get(f"{self._prefix}_cache_saved_at_text") or "").strip()
+            data_source = f"本地缓存 (缓存于 {saved_at})" if saved_at else "本地缓存"
+        else:
+            data_source = "实时接口"
+
+        attrs: Dict[str, Any] = {
+            "运营商": "中国电信",
+            "统计月份": self._month_text(full=True),
+            "数据来源": data_source,
+            "查询起始日期": self.data.get(f"{self._prefix}_start_date")
+            or self.data.get("call_start_date", "当月月初"),
+            "查询截至日期": self.data.get(f"{self._prefix}_end_date")
+            or self.data.get("call_end_date", "该月最后一天"),
+            "详单授权状态": self._auth_status,
+            "授权剩余有效时长": f"{rem_min} 分钟" if not self.data.get("call_need_auth") else "0 分钟",
+            "记录条数": len(records),
+            "汇总天数": len(self._daily),
+            "合计": total,
+            "按天汇总": self._daily,
+            "最近一条": records[0] if records else {},
+            self._list_attr: records,
+        }
+        attrs.update(self._extra_detail_attrs())
+        if from_cache:
+            attrs["缓存说明"] = (
+                "详单二次认证已过期，当前展示本地缓存的历史数据；重新认证后可拉取最新数据"
+            )
+        return attrs
+
+
+class TelecomSmsRecordSensor(_DetailRecordSensor):
+    """电信短信记录 (短信详单 type=2) → sensor.<手机号>_sms"""
+
+    _prefix = "sms"
+    _label = "短信"
+    _list_attr = "短信记录"
+    _idle_icon = "mdi:message-text-clock-outline"
+
+    def __init__(self, coordinator, phone: str):
+        desc = SensorEntityDescription(
+            key=SENSOR_SMS_RECORD,
+            name="短信记录",
+            icon="mdi:message-text-clock-outline",
+        )
+        super().__init__(coordinator, CARRIER_TELECOM, phone, desc)
+
+    def _normalize_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        return normalize_sms_record(record)
+
+    def _normalize_daily(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        return normalize_sms_daily(record)
+
+    def _counts(self) -> tuple:
+        """(发送条数, 接收条数)"""
+        sent = sum(int(r.get("count", 0) or 0) for r in self._records if r.get("type") == "发送")
+        received = sum(int(r.get("count", 0) or 0) for r in self._records if r.get("type") == "接收")
+        return sent, received
+
+    def _summary(self) -> str:
+        total = self._total
+        count = int(total.get("count") or self.data.get(f"{self._prefix}_count") or len(self._records))
+        fee = total.get("fee_yuan")
+        if fee is None:
+            fee = round(sum(float(r.get("fee_yuan", 0.0) or 0) for r in self._records), 2)
+        sent, received = self._counts()
+        direction = f"（发 {sent} / 收 {received}）" if (sent or received) else ""
+        return f"{self._month_text()} {count} 条{direction} · {float(fee):.2f} 元"
+
+    def _extra_detail_attrs(self) -> Dict[str, Any]:
+        sent, received = self._counts()
+        return {"发送条数": sent, "接收条数": received}
+
+
+class TelecomNetRecordSensor(_DetailRecordSensor):
+    """电信上网记录 (上网流量详单 type=3) → sensor.<手机号>_traffic"""
+
+    _prefix = "net"
+    _label = "上网"
+    _list_attr = "上网会话清单"
+    _idle_icon = "mdi:chart-timeline-variant"
+
+    def __init__(self, coordinator, phone: str):
+        desc = SensorEntityDescription(
+            key=SENSOR_NET_RECORD,
+            name="上网记录",
+            icon="mdi:chart-timeline-variant",
+        )
+        super().__init__(coordinator, CARRIER_TELECOM, phone, desc)
+
+    def _normalize_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        return normalize_net_record(record)
+
+    def _normalize_daily(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        return normalize_net_daily(record)
+
+    @staticmethod
+    def _fmt_mb(value: Any) -> str:
+        mb = float(value or 0)
+        if mb >= 1024:
+            return f"{mb / 1024:.2f} GB"
+        return f"{mb:.2f} MB"
+
+    @staticmethod
+    def _fmt_duration(seconds: Any) -> str:
+        total = int(float(seconds or 0))
+        hours, remain = divmod(total, 3600)
+        minutes = remain // 60
+        if hours:
+            return f"{hours}小时{minutes}分"
+        return f"{minutes}分钟"
+
+    @property
+    def total_volume_mb(self) -> float:
+        total = self._total
+        if total.get("volume_mb") is not None:
+            return float(total.get("volume_mb") or 0)
+        return sum(float(r.get("volume_mb", 0.0) or 0) for r in self._records)
+
+    @property
+    def total_duration_seconds(self) -> int:
+        total = self._total
+        if total.get("duration_seconds") is not None:
+            return int(total.get("duration_seconds") or 0)
+        return sum(int(r.get("duration_seconds", 0) or 0) for r in self._records)
+
+    def _summary(self) -> str:
+        total = self._total
+        fee = total.get("fee_yuan")
+        if fee is None:
+            fee = round(sum(float(r.get("fee_yuan", 0.0) or 0) for r in self._records), 2)
+        return (
+            f"{self._month_text()} {self._fmt_mb(self.total_volume_mb)}"
+            f" · {self._fmt_duration(self.total_duration_seconds)}"
+            f" · {float(fee):.2f} 元"
+        )
+
+    def _extra_detail_attrs(self) -> Dict[str, Any]:
+        sort_options = [
+            str(item.get("title"))
+            for item in (self.data.get("net_sort_list") or [])
+            if isinstance(item, dict) and item.get("title")
+        ]
+        filter_options = [
+            str(item.get("filterGroupName"))
+            for item in (self.data.get("net_filter_list") or [])
+            if isinstance(item, dict) and item.get("filterGroupName")
+        ]
+        return {
+            "合计用量": self._fmt_mb(self.total_volume_mb),
+            "合计时长": self._fmt_duration(self.total_duration_seconds),
+            "排序选项": sort_options,
+            "筛选选项": filter_options,
+        }
+
+
 def get_telecom_sensors(coordinator, phone: str, entry=None) -> List[BaseCarrierSensor]:
     """生成电信传感器列表 (包含自动根据手机号生成签名的通话记录传感器)"""
     return [
@@ -455,6 +711,8 @@ def get_telecom_sensors(coordinator, phone: str, entry=None) -> List[BaseCarrier
         TelecomOnlineSensor(coordinator, phone),
         TelecomLastUpdateSensor(coordinator, phone),
         TelecomCallRecordSensor(coordinator, phone),
+        TelecomSmsRecordSensor(coordinator, phone),
+        TelecomNetRecordSensor(coordinator, phone),
     ]
 
 
