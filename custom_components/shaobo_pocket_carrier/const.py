@@ -46,9 +46,24 @@ SENSOR_CALL_RECORD = "call_record"      # 通话记录 (语音详单，需 signa
 ENTITY_CALL_AUTH_NAME = "call_auth_name"            # text: 机主姓名
 ENTITY_CALL_AUTH_ID_CARD = "call_auth_id_card"      # text: 身份证号码
 ENTITY_CALL_AUTH_CODE = "call_auth_code"            # text: 短信验证码
-ENTITY_CALL_AUTH_BUTTON = "call_auth_secondary"     # button: 二次认证 / 手动拉取流水
+ENTITY_CALL_AUTH_BUTTON = "call_auth_secondary"     # button: 二次认证 / 登录 / 手动拉取流水
 ENTITY_CALL_QUERY_START_DATE = "call_query_start_date"   # date: 通话流水查询起始日期
-CALL_AUTH_WAIT_SECONDS = 180                        # 下发验证码后等待写入并自动提交的最长秒数
+ENTITY_CALL_QUERY_DAILY_RESET = "call_query_daily_reset"  # switch: 每天定时把查询起始日期恢复为当月 1 日
+ENTITY_REGION_UPDATE_BUTTON = "region_db_update"      # button: 手动下载更新号码归属地库
+ENTITY_REGION_AUTO_SWITCH = "region_auto_update"      # switch: 自动检查并更新号码归属地库
+ENTITY_AUTO_LOGIN_SWITCH = "auto_login_switch"      # switch: 登录失效后自动短信登录
+ENTITY_AUTO_QUERY_SWITCH = "auto_query_switch"      # switch: 自动获取通话记录 (定时 + 登录后)
+ENTITY_AUTO_QUERY_TIME = "auto_query_time"          # time: 每日自动获取通话记录的时间
+
+CALL_AUTH_WAIT_SECONDS = 180    # 详单验证码等待窗口 (下发后等待写入并自动提交的最长秒数)
+LOGIN_SMS_WAIT_SECONDS = 180    # 登录验证码等待窗口
+AUTO_LOGIN_MAX_FAILURES = 3     # 自动登录连续失败达到该次数后停止自动登录
+AFTER_LOGIN_QUERY_DELAY = 60    # 登录成功后延迟多少秒再自动获取通话记录 (避免两种验证码串味)
+DEFAULT_AUTO_QUERY_TIME = "08:00:00"    # 自动获取通话记录的默认时间
+DAILY_RESET_START_DATE_TIME = "06:00"   # 每日把「通话详单查询起始日期」恢复为当月 1 日的时间
+EVENT_LOGIN_EXPIRED = f"{DOMAIN}_login_expired"     # 登录失效事件 (登录失效时抛出)
+EVENT_LOGIN_SUCCESS = f"{DOMAIN}_login_success"     # 短信登录成功事件 (供自动获取模块监听)
+LOGIN_CODE_LENGTH = 6           # 登录验证码位数 (login_with_sms 内部按 6 位处理)
 
 SENSOR_SMS_REMAIN = "sms_remain"        # 剩余短信
 SENSOR_INTEGRAL = "integral"            # 会员积分
@@ -62,6 +77,7 @@ SENSOR_SPEED_SERVICE = "speed_service"      # 速率服务
 SENSOR_BROADBAND_COUNT = "broadband_count"  # 名下宽带
 SENSOR_BROADBAND = "broadband"          # 宽带速率
 SENSOR_ACCOUNT_STATUS = "account_status"# 账户状态
+SENSOR_ONLINE = "online"                # 账号在线状态 (在线/离线/未知)
 SENSOR_LAST_UPDATE = "last_update"      # 最近刷新时间
 SENSOR_OVERVIEW = "overview"            # 全设备数据聚合总览 (把各传感器状态/属性合并成一个实体)
 
@@ -72,6 +88,7 @@ OVERVIEW_CALL_LIMIT_DEFAULT = 0
 
 # 数据总览实体的节点展示顺序 (按传感器 key, 未列出的自动排在其后)
 OVERVIEW_NODE_ORDER = (
+    SENSOR_ONLINE,
     SENSOR_ACCOUNT_STATUS,
     SENSOR_BALANCE,
     SENSOR_CHARGE,
@@ -101,17 +118,52 @@ OVERVIEW_NODE_ORDER = (
 OVERVIEW_CALL_LIST_ATTR = "通话流水清单"
 
 # 固定实体 ID 后缀表 (按实体 key)
-# 实体 ID 形如 <domain>.<手机号>_<后缀>，例如:
+# 实体 ID 形如 <domain>.<手机号>_<后缀>，后缀一律使用简短英文单词 (不用拼音)，例如:
 #   text.133xxxxxxxx_code / text.133xxxxxxxx_name / text.133xxxxxxxx_id_card
-#   button.133xxxxxxxx_button / date.133xxxxxxxx_date / sensor.133xxxxxxxx_overview
+#   button.133xxxxxxxx_button / date.133xxxxxxxx_date
+#   switch.133xxxxxxxx_auto_login / time.133xxxxxxxx_auto_query_time
+#   sensor.133xxxxxxxx_balance / sensor.133xxxxxxxx_calls / sensor.133xxxxxxxx_overview
+# 未列出的实体退化为使用实体 key 本身作为后缀。
 # 目的: 让自动化/手机端转发脚本可以长期稳定引用，不受实体名称变化影响
 ENTITY_ID_SUFFIXES = {
+    # 控制类实体
     ENTITY_CALL_AUTH_NAME: "name",
     ENTITY_CALL_AUTH_ID_CARD: "id_card",
     ENTITY_CALL_AUTH_CODE: "code",
     ENTITY_CALL_AUTH_BUTTON: "button",
     ENTITY_CALL_QUERY_START_DATE: "date",
-    SENSOR_OVERVIEW: "overview",
+    ENTITY_CALL_QUERY_DAILY_RESET: "daily_reset",
+    ENTITY_REGION_UPDATE_BUTTON: "update_region",
+    ENTITY_REGION_AUTO_SWITCH: "auto_region_update",
+    ENTITY_AUTO_LOGIN_SWITCH: "auto_login",
+    ENTITY_AUTO_QUERY_SWITCH: "auto_query",
+    ENTITY_AUTO_QUERY_TIME: "auto_query_time",
+    # 传感器实体 (简短英文单词)
+    SENSOR_OVERVIEW: "overview",            # 数据总览
+    SENSOR_BALANCE: "balance",              # 话费余额
+    SENSOR_CHARGE: "charge",                # 本月消费
+    SENSOR_FLOW_REMAIN: "data",             # 剩余通用流量
+    SENSOR_FLOW_USED: "data_used",          # 已用流量
+    SENSOR_FLOW_DIRECTIONAL: "data_dir",    # 剩余定向流量
+    SENSOR_FEE_DEPOSIT: "deposit",          # 本月存入话费
+    SENSOR_FEE_ROLLOVER: "rollover",        # 上月结转话费
+    SENSOR_VOICE_REMAIN: "voice",           # 共享通话剩余 / 剩余语音
+    SENSOR_VOICE_USED: "voice_used",        # 共享通话已用 / 已用语音
+    SENSOR_SMS_REMAIN: "sms",               # 剩余短信
+    SENSOR_CALL_RECORD: "calls",            # 通话记录
+    SENSOR_INTEGRAL: "points",              # 积分
+    SENSOR_STAR_LEVEL: "star",              # 用户星级
+    SENSOR_MEMBER_LEVEL: "level",           # 会员等级
+    SENSOR_REAL_NAME: "owner",              # 机主姓名
+    SENSOR_PHONE: "phone",                  # 手机号码
+    SENSOR_CUST_NAME: "account",            # 单位户号/户名
+    SENSOR_SPEED_SERVICE: "service",        # 套餐服务 / 速率服务
+    SENSOR_LOCATION: "location",            # 号码归属地
+    SENSOR_ACCOUNT_STATUS: "status",        # 账户状态
+    SENSOR_ONLINE: "online",                # 在线状态
+    SENSOR_LAST_UPDATE: "updated",          # 数据最近更新
+    SENSOR_BROADBAND: "broadband",          # 宽带速率
+    SENSOR_BROADBAND_COUNT: "broadbands",   # 名下宽带
 }
 
 # 轮询间隔

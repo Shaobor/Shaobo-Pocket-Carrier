@@ -7,7 +7,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 
-from .base import BaseCarrierSensor
+from .base import BaseCarrierSensor, BaseOnlineSensor
 from ..const import (
     CARRIER_UNICOM,
     SENSOR_PHONE,
@@ -75,7 +75,7 @@ class UnicomRealNameSensor(BaseCarrierSensor):
         name = self.data.get("real_name")
         if name and str(name).strip():
             return str(name).strip()
-        return "错误"
+        return "未知"
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
@@ -116,7 +116,7 @@ class UnicomCustNameSensor(BaseCarrierSensor):
             "单位名称": self.data.get("cust_name", "无"),
             "单位户号/税号": self.data.get("cust_cert_num", "无"),
             "证件类型": self.data.get("cust_cert_type", "营业执照(组织机构代码)"),
-            "实际使用人": self.data.get("real_name", "王**"),
+            "实际使用人": self.data.get("real_name") or "未知",
             "使用人证件": self.data.get("cert_code", ""),
             "客户类型": "政企/单位客户" if self.data.get("cust_name") else "个人客户",
             "运营商": "中国联通",
@@ -424,7 +424,7 @@ class UnicomLastUpdateSensor(BaseCarrierSensor):
 
 
 def get_unicom_sensors(coordinator, phone: str) -> List[BaseCarrierSensor]:
-    """生成该联通手机号下的专属传感器实例 (全量规范注册，统一 12 个实体)"""
+    """生成该联通手机号下的专属传感器实例 (全量规范注册，统一 13 个实体)"""
     return [
         UnicomPhoneSensor(coordinator, phone),
         UnicomRealNameSensor(coordinator, phone),
@@ -438,5 +438,13 @@ def get_unicom_sensors(coordinator, phone: str) -> List[BaseCarrierSensor]:
         UnicomLocationSensor(coordinator, phone),
         UnicomAccountSensor(coordinator, phone),
         UnicomLastUpdateSensor(coordinator, phone),
+        UnicomOnlineSensor(coordinator, phone),
     ]
+
+
+class UnicomOnlineSensor(BaseOnlineSensor):
+    """联通账号在线状态 (在线/离线/未知)，会作为节点合并进「数据总览」实体"""
+
+    def __init__(self, coordinator, phone: str):
+        super().__init__(coordinator, CARRIER_UNICOM, phone)
 

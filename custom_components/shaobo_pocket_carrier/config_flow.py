@@ -509,7 +509,7 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
             # 选项流自行下发验证码前，先取消实体侧「验证码写入即自动提交」的等待窗口，
             # 避免「通话详单验证码」实体抢先消费掉本次验证码 (两个入口互相打架)
             try:
-                from .platforms.telecom_auth import async_cancel_call_auth_auto_submit
+                from .platforms.auth_runtime import async_cancel_call_auth_auto_submit
 
                 async_cancel_call_auth_auto_submit(self.hass, self.target_entry)
             except Exception as err:

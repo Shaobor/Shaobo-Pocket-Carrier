@@ -205,7 +205,8 @@ class CarrierOverviewSensor(ForcedEntityIdMixin, CoordinatorEntity, SensorEntity
             try:
                 return float(state.state)
             except (TypeError, ValueError):
-                return state.state
+                # 本实体声明了单位"元"，非数值时只能返回 None (避免类型/单位不一致告警)
+                return None
         return None
 
     @property
