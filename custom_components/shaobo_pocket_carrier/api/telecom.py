@@ -254,13 +254,19 @@ def _parse_traffic_detail(container: Dict[str, Any], year: int) -> Dict[str, Any
 
 
 _SMS_TIME_KEYS = ("time", "callTime", "smsTime", "sendTime", "startTime", "datetime", "date")
-_SMS_NUMBER_KEYS = ("oppositeNumber", "calleNo", "otherNumber", "number", "phoneNumber",
-                    "calledNo", "callNo", "oppositeNo", "peerNumber", "smsNumber")
-_SMS_TYPE_KEYS = ("type", "smsType", "callType", "direction", "sendType", "smsDirection")
+# 实测(2026-09-30): 对端号码字段名是 sendNo (发送) / receiveNo (接收)，值为 ASCIIDencrypt 加密串
+_SMS_NUMBER_KEYS = ("sendNo", "receiveNo", "showNo", "otherNo", "contactNo",
+                    "oppositeNumber", "oppositeNo", "otherNumber", "peerNumber",
+                    "calleNo", "calledNo", "callNo", "phoneNumber", "smsNumber", "number")
+# 实测: 类型字段名是 shortMessageType，值为"发送短信"/"接收短信"
+_SMS_TYPE_KEYS = ("shortMessageType", "smsType", "callType", "type", "direction", "sendType")
 _SMS_COUNT_KEYS = ("count", "smsCount", "amount", "num", "numberCount", "piece")
 _SMS_FEE_KEYS = ("fee", "totalCharge", "charge", "totalFee", "feeByDay")
+# 纯展示字段: 不写进记录 (icon 是客户端图标地址, 没有信息量)
+_SMS_NOISE_KEYS = ("icon",)
 _SMS_ALIAS_KEYS = frozenset(
-    _SMS_TIME_KEYS + _SMS_NUMBER_KEYS + _SMS_TYPE_KEYS + _SMS_COUNT_KEYS + _SMS_FEE_KEYS
+    _SMS_TIME_KEYS + _SMS_NUMBER_KEYS + _SMS_TYPE_KEYS + _SMS_COUNT_KEYS
+    + _SMS_FEE_KEYS + _SMS_NOISE_KEYS
 )
 _ONLY_TIME_RE = re.compile(r"^\d{1,2}:\d{1,2}(?::\d{1,2})?$")
 
@@ -280,48 +286,61 @@ def _nested_rows(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def _sms_direction(raw: Any) -> str:
+    """短信方向: "发送短信"/"1" -> 发送; "接收短信"/"2" -> 接收 (实现与 phone_region 一致)"""
+    try:
+        from ..phone_region import sms_direction
+
+        return sms_direction(raw)
+    except Exception:
+        text = str(raw or "").strip()
+        if "发" in text or text == "1":
+            return "发送"
+        if "收" in text or "接" in text or text == "2":
+            return "接收"
+        return text
+
+
 def _normalize_detail_number(raw: Any) -> str:
     """详单里的号码一律按 ASCIIDencrypt(每字符 -2) 还原 (与通话记录 calleNo 同一套算法)
 
-    还原结果不像号码时退回原值, 避免把明文号码改坏。
+    实现统一放在 phone_region.decrypt_number；还原结果不像号码时退回原值，避免把明文改坏。
     """
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    decoded = _ascii_decrypt(text)
-    if re.fullmatch(r"[+\d\-\s]{4,24}", decoded):
-        return decoded.strip()
-    return text
+    try:
+        from ..phone_region import decrypt_number
+
+        return decrypt_number(raw)
+    except Exception:  # phone_region 不可用时退回本地等价实现
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        decoded = _ascii_decrypt(text)
+        if re.fullmatch(r"[+\d\-\s]{4,24}", decoded):
+            return decoded.strip()
+        return text
 
 
 def _parse_sms_detail(container: Dict[str, Any], year: int) -> Dict[str, Any]:
     """短信详单 -> {records, daily, total}
 
-    本机号码当月无短信记录，拿不到真实字段样例，因此按"防御式"解析：
-    - 自动识别容器里的记录列表键（与流量侧对称时是 按天行 + *SecList 二级明细）
-    - 字段用别名表匹配（时间/对端号码/类型/条数/费用），未知字段原样保留
-    - 只有时间(时:分:秒)时, 用所在天的日期补全 datetime
+    真实字段（2026-09-30 实测于 17792405320）：平铺结构 `shortMessageDetailList[]`，
+    每条含 `sendNo`(对端号码, ASCIIDencrypt) / `shortMessageType`(发送短信|接收短信) /
+    `date` / `time` / `fee` / `icon`；合计块 `shortMessageDetailTotalList[]`（标题形如"详单条数"）。
+    也兼容与流量侧对称的"按天行 + *SecList 二级明细"结构：
+    - 自动识别容器里的记录列表键
+    - 字段用别名表匹配（时间 / 对端号码 / 类型 / 条数 / 费用），未知字段原样保留
+    - 只有时间(时:分:秒)时，用所在天的日期补全 datetime
+    - 按天汇总按日期合并（平铺结构下逐条累加）
     """
     records: List[Dict[str, Any]] = []
-    daily: List[Dict[str, Any]] = []
+    daily_map: Dict[Any, Dict[str, Any]] = {}
     for day in _pick_rows(container):
         if not isinstance(day, dict):
             continue
         date_text = str(day.get("date", "") or "")
         date_value = _format_detail_date(date_text or _first_value(day, _SMS_TIME_KEYS), year)
         nested = _nested_rows(day)
-        day_fee_raw = _first_value(day, _SMS_FEE_KEYS)
-        day_count = int(_parse_yuan(_first_value(day, _SMS_COUNT_KEYS)))
-        # 有二级明细时, 按天行的 count/fee 只作为"当日汇总", 不渗进明细
-        if nested or day_count or str(day_fee_raw or "").strip():
-            daily.append({
-                "date": date_value,
-                "date_text": date_text or date_value,
-                "count": day_count or len(nested),
-                "fee": str(day_fee_raw or ""),
-                "fee_yuan": _parse_yuan(day_fee_raw),
-                "items": len(nested),
-            })
+        day_records: List[Dict[str, Any]] = []
         for item in (nested or [day]):
             source = dict(item)
             # 明细里缺日期时, 用所在天补上下文 (只补日期类字段)
@@ -356,12 +375,27 @@ def _parse_sms_detail(container: Dict[str, Any], year: int) -> Dict[str, Any]:
                 if key in record or key in _SMS_ALIAS_KEYS or isinstance(value, (dict, list)):
                     continue
                 record[key] = value
-            records.append(record)
+            day_records.append(record)
+        records.extend(day_records)
+
+        # 按天汇总: 每天按"发送/接收"各一行, 只保留 date / count / type / fee(纯数字, 元)
+        for record in day_records:
+            key = (record.get("date") or date_value, _sms_direction(record.get("type")))
+            amount = int(record.get("count", 1) or 1)
+            fee = float(record.get("fee_yuan", 0.0) or 0)
+            entry = daily_map.get(key)
+            if entry is None:
+                daily_map[key] = {"date": key[0], "count": amount, "type": key[1], "fee": round(fee, 2)}
+            else:
+                entry["count"] += amount
+                entry["fee"] = round(entry["fee"] + fee, 2)
+
     total = _total_map(_pick_total_items(container))
     if "count" not in total:
         total["count"] = sum(r.get("count", 0) for r in records)
     if "fee_yuan" not in total:
         total["fee_yuan"] = round(sum(r.get("fee_yuan", 0.0) for r in records), 2)
+    daily = sorted(daily_map.values(), key=lambda row: str(row.get("date", "")), reverse=True)
     return {"records": records, "daily": daily, "total": total}
 
 

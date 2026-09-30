@@ -28,6 +28,7 @@ from ..const import (
     DOMAIN,
     OVERVIEW_CALL_LIMIT_DEFAULT,
     OVERVIEW_DETAIL_LIST_ATTRS,
+    OVERVIEW_NODE_ATTR_KEYS,
     OVERVIEW_NODE_ORDER,
     SENSOR_BALANCE,
     SENSOR_OVERVIEW,
@@ -217,7 +218,7 @@ class CarrierOverviewSensor(ForcedEntityIdMixin, CoordinatorEntity, SensorEntity
 
         limit = self._call_limit()
         nodes: Dict[str, Any] = {}
-        for _key, entity_id, name in self._sources:
+        for key, entity_id, name in self._sources:
             state = self.hass.states.get(entity_id)
             if state is None:
                 continue
@@ -231,8 +232,14 @@ class CarrierOverviewSensor(ForcedEntityIdMixin, CoordinatorEntity, SensorEntity
             if icon:
                 node["icon"] = icon
 
+            # 详单类节点只搬运白名单子属性 (清单/按天汇总/合计), 其余属性不重复搬运,
+            # 否则总览属性会成倍膨胀; 单个实体本身仍保留完整属性
+            allowed = OVERVIEW_NODE_ATTR_KEYS.get(key)
+
             for attr_key, value in attrs.items():
                 if attr_key in _NODE_SKIP_KEYS:
+                    continue
+                if allowed is not None and attr_key not in allowed:
                     continue
                 if attr_key in OVERVIEW_DETAIL_LIST_ATTRS and limit > 0 and isinstance(value, list):
                     # 保留最近的 limit 条 (原始清单按时间倒序, 最新在前)

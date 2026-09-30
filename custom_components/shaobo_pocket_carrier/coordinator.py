@@ -303,6 +303,22 @@ class TelecomDataUpdateCoordinator(DataUpdateCoordinator):
                     if cached.get("end_date"):
                         data["call_end_date"] = cached["end_date"]
                 else:
+                    if prefix == "sms":
+                        # 缓存里的短信记录可能是早期版本解析的(只有 sendNo 原始字段),
+                        # 这里补一次对端号码还原 + 归属地/坐标
+                        try:
+                            from .phone_region import enrich_number_fields, decrypt_number
+
+                            for record in records:
+                                if not str(record.get("phone_number", "")).strip():
+                                    for key in ("sendNo", "receiveNo", "oppositeNumber", "calleNo"):
+                                        if record.get(key):
+                                            record["phone_number_raw"] = str(record[key])
+                                            record["phone_number"] = decrypt_number(record[key])
+                                            break
+                            enrich_number_fields(records)
+                        except Exception as err:
+                            _LOGGER.debug("整理缓存短信记录失败(已跳过): %s", err)
                     data[f"{prefix}_records"] = records
                     data[f"{prefix}_count"] = cached.get(f"{prefix}_count") or len(records)
                     data[f"{prefix}_daily"] = cached.get(f"{prefix}_daily") or []
