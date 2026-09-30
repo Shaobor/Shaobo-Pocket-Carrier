@@ -15,6 +15,9 @@ ha_run/
 # 忽略本地前端大文件（room-elves-card.js 等，不随版本发布）
 custom_components/shaobo_pocket_carrier/frontend/
 
+# 忽略本地公告草稿
+公告草稿/
+
 # 忽略本地逆向分析目录与敏感测试数据
 电信13.4-接口分析/
 联通13.1-接口分析/
