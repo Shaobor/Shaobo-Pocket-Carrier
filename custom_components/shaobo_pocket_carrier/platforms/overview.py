@@ -27,7 +27,7 @@ from ..const import (
     CONF_OVERVIEW_CALL_LIMIT,
     DOMAIN,
     OVERVIEW_CALL_LIMIT_DEFAULT,
-    OVERVIEW_CALL_LIST_ATTR,
+    OVERVIEW_DETAIL_LIST_ATTRS,
     OVERVIEW_NODE_ORDER,
     SENSOR_BALANCE,
     SENSOR_OVERVIEW,
@@ -234,7 +234,7 @@ class CarrierOverviewSensor(ForcedEntityIdMixin, CoordinatorEntity, SensorEntity
             for attr_key, value in attrs.items():
                 if attr_key in _NODE_SKIP_KEYS:
                     continue
-                if attr_key == OVERVIEW_CALL_LIST_ATTR and limit > 0 and isinstance(value, list):
+                if attr_key in OVERVIEW_DETAIL_LIST_ATTRS and limit > 0 and isinstance(value, list):
                     # 保留最近的 limit 条 (原始清单按时间倒序, 最新在前)
                     value = value[:limit]
                 node[attr_key] = value

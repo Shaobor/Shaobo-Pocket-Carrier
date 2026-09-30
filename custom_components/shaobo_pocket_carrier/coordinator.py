@@ -189,91 +189,148 @@ class TelecomDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.debug("启动重新认证流程失败(忽略): %s", err)
 
-    async def _async_sync_call_record_cache(self, data: Dict[str, Any]) -> None:
-        """同步通话流水本地缓存
+    @staticmethod
+    def _sort_detail_records(prefix: str, records: list) -> list:
+        """详单记录按时间倒序 (接口不保证顺序)
 
-        - 二次认证有效且拉到流水: 覆盖写入本地缓存
-        - 二次认证失效/拉取异常: 用本地缓存兜底填充，避免历史流水凭空消失
+        "最近一次通话/最新一条短信/最新一次上网"与缓存截断都假设按时间倒序，
+        排序失败时保持原顺序, 不影响主流程。
+        """
+        key_name = "call_time" if prefix == "call" else "datetime"
+        try:
+            return sorted(records, key=lambda r: str(r.get(key_name, "")), reverse=True)
+        except Exception as err:
+            _LOGGER.debug("%s 详单排序失败(保持原顺序): %s", prefix, err)
+            return records
+
+    async def _async_sync_call_record_cache(self, data: Dict[str, Any]) -> None:
+        """同步"通话 / 短信 / 上网流量"三类详单的本地缓存
+
+        - 二次认证有效且拉到记录: 三类一起覆盖写入 (同一个缓存文件，避免互相覆盖)
+        - 二次认证失效/拉取异常: 三类都用本地缓存兜底填充，避免历史数据凭空消失
         """
         try:
-            records = data.get("call_records") or []
             need_auth = data.get("call_need_auth") is True
-
-            if records:
-                # 防御性排序: 后续"最近一次通话"与缓存截断都假设按时间倒序，
-                # 而运营商接口并不保证顺序，避免把最旧的一条当成最近通话
-                try:
-                    records = sorted(
-                        records, key=lambda r: str(r.get("call_time", "")), reverse=True
-                    )
-                except Exception as err:
-                    _LOGGER.debug("通话流水排序失败(保持原顺序): %s", err)
+            # 通话保持旧键名 (records/call_count/last_call)，短信与流量用 <prefix>_ 前缀
+            collected: Dict[str, Dict[str, Any]] = {}
+            for prefix in ("call", "sms", "net"):
+                # 数据字典里通话流水的键名是 call_records (缓存文件里才是 records)
+                raw = list(data.get("call_records" if prefix == "call" else f"{prefix}_records") or [])
+                collected[prefix] = {
+                    "records": self._sort_detail_records(prefix, raw),
+                    "count": data.get("call_count" if prefix == "call" else f"{prefix}_count") or len(raw),
+                    "daily": data.get(f"{prefix}_daily") or [],
+                    "total": data.get(f"{prefix}_total") or {},
+                    "last": data.get("last_call" if prefix == "call" else f"{prefix}_last")
+                    or (raw[0] if raw else {}),
+                    "start": data.get(f"{prefix}_start_date") or data.get("call_start_date", ""),
+                    "end": data.get(f"{prefix}_end_date") or data.get("call_end_date", ""),
+                }
 
             if not need_auth:
-                # 认证有效: 仅在真的拉到流水时落盘
-                # (接口成功但返回空只代表当前查询区间确实无通话，不覆盖历史缓存)
-                if not records:
+                # 认证有效: 仅在真的拉到记录时落盘
+                # (接口成功但返回空只代表当前查询区间确实无记录，不覆盖历史缓存)
+                if not any(group["records"] for group in collected.values()):
                     return
 
-                signature = [
-                    len(records),
-                    str(records[0].get("call_time", "")),
-                    str(records[-1].get("call_time", "")),
-                    str(data.get("call_start_date", "")),
-                    str(data.get("call_end_date", "")),
-                ]
+                signature = []
+                for prefix in ("call", "sms", "net"):
+                    group = collected[prefix]
+                    time_key = "call_time" if prefix == "call" else "datetime"
+                    first = group["records"][0] if group["records"] else {}
+                    last = group["records"][-1] if group["records"] else {}
+                    signature.append([
+                        len(group["records"]),
+                        str(first.get(time_key, "")),
+                        str(last.get(time_key, "")),
+                        str(group["start"]),
+                        str(group["end"]),
+                    ])
                 cached = await self.call_cache.async_load()
                 if cached.get("signature") == signature:
                     return
 
-                await self.call_cache.async_save({
+                payload: Dict[str, Any] = {
                     "signature": signature,
-                    "records": records[:CALL_CACHE_MAX_RECORDS],
-                    "call_count": len(records),
-                    "last_call": data.get("last_call") or records[0],
-                    "start_date": str(data.get("call_start_date", "")),
-                    "end_date": str(data.get("call_end_date", "")),
-                })
-                _LOGGER.debug("电信手机号 %s 通话流水已写入本地缓存 (%d 条)", self.phone, len(records))
+                    "records": collected["call"]["records"][:CALL_CACHE_MAX_RECORDS],
+                    "call_count": collected["call"]["count"],
+                    "last_call": collected["call"]["last"],
+                    "start_date": str(collected["call"]["start"]),
+                    "end_date": str(collected["call"]["end"]),
+                }
+                for prefix in ("sms", "net"):
+                    group = collected[prefix]
+                    payload[f"{prefix}_records"] = group["records"][:CALL_CACHE_MAX_RECORDS]
+                    payload[f"{prefix}_count"] = group["count"]
+                    payload[f"{prefix}_daily"] = group["daily"]
+                    payload[f"{prefix}_total"] = group["total"]
+                    payload[f"{prefix}_last"] = group["last"]
+                    payload[f"{prefix}_start_date"] = str(group["start"])
+                    payload[f"{prefix}_end_date"] = str(group["end"])
+                await self.call_cache.async_save(payload)
+                _LOGGER.debug(
+                    "电信手机号 %s 详单已写入本地缓存 (通话 %d / 短信 %d / 流量 %d 条)",
+                    self.phone,
+                    len(collected["call"]["records"]),
+                    len(collected["sms"]["records"]),
+                    len(collected["net"]["records"]),
+                )
                 return
 
-            # 认证失效: 用本地缓存兜底展示
+            # 认证失效: 三类都用本地缓存兜底展示
             cached = await self.call_cache.async_load()
-            cached_records = cached.get("records") or []
-            if not cached_records:
+            saved_text = cached.get("saved_at_text", "")
+            restored = 0
+            for prefix in ("call", "sms", "net"):
+                records = cached.get("records" if prefix == "call" else f"{prefix}_records") or []
+                if not records:
+                    continue
+                # 历史缓存可能是旧字段名 (calle_no/call_area/total_charge)，
+                # 这里统一整理并补一次归属地 (用户后来才启用/更新归属地库时也能补上)
+                if prefix == "call":
+                    try:
+                        from .phone_region import enrich_records, get_index
+
+                        enrich_records(get_index(), records)
+                    except Exception as err:
+                        _LOGGER.debug("整理缓存流水失败(已跳过): %s", err)
+                    data["call_records"] = records
+                    # 缓存里 call_count 是截断前的全量条数，优先用它，避免"本月通话次数"前后不一致
+                    data["call_count"] = cached.get("call_count") or len(records)
+                    data["last_call"] = cached.get("last_call") or records[0]
+                    if cached.get("start_date"):
+                        data["call_start_date"] = cached["start_date"]
+                    if cached.get("end_date"):
+                        data["call_end_date"] = cached["end_date"]
+                else:
+                    data[f"{prefix}_records"] = records
+                    data[f"{prefix}_count"] = cached.get(f"{prefix}_count") or len(records)
+                    data[f"{prefix}_daily"] = cached.get(f"{prefix}_daily") or []
+                    data[f"{prefix}_total"] = cached.get(f"{prefix}_total") or {}
+                    data[f"{prefix}_last"] = cached.get(f"{prefix}_last") or records[0]
+                    if cached.get(f"{prefix}_start_date"):
+                        data[f"{prefix}_start_date"] = cached[f"{prefix}_start_date"]
+                    if cached.get(f"{prefix}_end_date"):
+                        data[f"{prefix}_end_date"] = cached[f"{prefix}_end_date"]
+                    data[f"{prefix}_status"] = "已过期 (需重新认证) · 展示本地缓存"
+                data[f"{prefix}_data_from_cache"] = True
+                data[f"{prefix}_cache_saved_at"] = cached.get("saved_at", 0.0)
+                data[f"{prefix}_cache_saved_at_text"] = saved_text
+                restored += len(records)
+
+            if not restored:
                 return
-
-            # 历史缓存可能是旧字段名 (calle_no/call_area/total_charge)，
-            # 这里统一整理并补一次归属地 (用户后来才启用/更新归属地库时也能补上)
-            try:
-                from .phone_region import enrich_records, get_index
-
-                enrich_records(get_index(), cached_records)
-            except Exception as err:
-                _LOGGER.debug("整理缓存流水失败(已跳过): %s", err)
-
-            data["call_records"] = cached_records
-            # 缓存里 call_count 是截断前的全量条数，优先用它，避免"本月通话次数"前后不一致
-            data["call_count"] = cached.get("call_count") or len(cached_records)
-            data["last_call"] = cached.get("last_call") or cached_records[0]
-            data["call_data_from_cache"] = True
-            data["call_cache_saved_at"] = cached.get("saved_at", 0.0)
-            data["call_cache_saved_at_text"] = cached.get("saved_at_text", "")
-            if cached.get("start_date"):
-                data["call_start_date"] = cached["start_date"]
-            if cached.get("end_date"):
-                data["call_end_date"] = cached["end_date"]
 
             status = str(data.get("call_auth_status") or "已过期 (需重新认证)")
             data["call_auth_status"] = f"{status} · 展示本地缓存流水"
             _LOGGER.debug(
-                "电信手机号 %s 详单授权已失效，改用本地缓存流水 %d 条 (缓存于 %s)",
+                "电信手机号 %s 详单授权已失效，改用本地缓存 (共 %d 条, 缓存于 %s)",
                 self.phone,
-                len(cached_records),
-                cached.get("saved_at_text", "未知时间"),
+                restored,
+                saved_text or "未知时间",
             )
         except Exception as err:
-            _LOGGER.warning("同步电信手机号 %s 通话流水本地缓存异常: %s", self.phone, err)
+            _LOGGER.warning("同步电信手机号 %s 详单本地缓存异常: %s", self.phone, err)
 
     async def async_send_call_auth_sms(self) -> tuple[bool, str]:
         """下发通话流水(语音详单)二次认证短信验证码 (内部自动完成滑块识别)"""

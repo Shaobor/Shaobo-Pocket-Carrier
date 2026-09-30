@@ -11,6 +11,7 @@ import uuid
 import io
 import logging
 import re
+from typing import Any, Dict, List, Optional
 import requests
 import numpy as np
 from PIL import Image
@@ -34,6 +35,334 @@ def enrich_call_records(records) -> None:
         enrich_records(get_index(), records)
     except Exception as err:
         _LOGGER.debug("补充号码归属地失败(已跳过): %s", err)
+
+
+# =====================================================================
+# 详单解析 (短信详单 / 上网流量详单)
+#
+# 三类详单走同一个接口 query/queryDetailsV2，用 type 区分并共用同一次二次认证：
+#   type=1 语音  -> data.voiceDetail        (voiceDetailList)
+#   type=2 短信  -> data.shortMessageDetail
+#   type=3 上网  -> data.trafficDetail      (trafficDetailList / trafficDetailSecList / trafficDetailTotalList)
+#   type=4 增值业务费 -> data.addedSerDedDetail        (type=5 起接口直接报"第3方系统业务失败")
+# 实测样例(2026-09-30)见 _pr/body.md；短信侧结构与流量对称，但本机号码当月无短信记录，
+# 因此短信解析写成"防御式"：自动识别列表键与字段别名，未知字段原样保留。
+# =====================================================================
+_DETAIL_TIME_RE = re.compile(
+    r"(?:(\d{4})[年/-])?(\d{1,2})[月/-](\d{1,2})[日]?\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?"
+)
+_DETAIL_DATE_RE = re.compile(r"(?:(\d{4})[年/-])?(\d{1,2})[月/-](\d{1,2})[日]?")
+
+
+def _ascii_decrypt(raw: str) -> str:
+    """电信 App 逆向算法 ASCIIDencrypt: 每位字符 ASCII 码减 2 (对方号码)"""
+    if not raw or not isinstance(raw, str):
+        return ""
+    try:
+        return "".join(chr(ord(c) - 2) for c in raw)
+    except Exception:
+        return raw
+
+
+def _looks_encrypted(raw: str) -> bool:
+    """"13363902861" 被加密后是 "3778612:83" 这种形态 —— 含非数字字符才需要还原"""
+    text = str(raw or "")
+    return bool(text) and not text.isdigit() and not text.startswith("+")
+
+
+def _format_detail_time(raw, default_year: int) -> str:
+    """"9月30日 09:51:03" -> "2026-09-30 09:51:03" (无法解析时返回原文)"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    m = _DETAIL_TIME_RE.search(text)
+    if not m:
+        return text
+    year = int(m.group(1)) if m.group(1) else default_year
+    return "%04d-%02d-%02d %02d:%02d:%02d" % (
+        year, int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)),
+        int(m.group(6) or 0),
+    )
+
+
+def _format_detail_date(raw, default_year: int) -> str:
+    """按天汇总里的 "9月30日" -> "2026-09-30" (已规范则原样返回)"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    m = _DETAIL_DATE_RE.fullmatch(text)
+    if not m:
+        m = _DETAIL_DATE_RE.search(text)
+    if not m:
+        return text
+    year = int(m.group(1)) if m.group(1) else default_year
+    return "%04d-%02d-%02d" % (year, int(m.group(2)), int(m.group(3)))
+
+
+def _parse_volume_mb(text) -> float:
+    """流量文本 -> MB (二进制换算, 与运营商口径一致): "58.99MB"/"59KB"/"1.69GB" """
+    raw = str(text or "").strip().upper()
+    if not raw:
+        return 0.0
+    m = re.search(r"([\d.]+)\s*(TB|GB|MB|KB|B)?", raw)
+    if not m:
+        return 0.0
+    try:
+        value = float(m.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+    return value * {"TB": 1024 * 1024, "GB": 1024, "MB": 1, "KB": 1 / 1024, "B": 1 / (1024 * 1024)}.get(
+        m.group(2) or "MB", 1
+    )
+
+
+def _parse_duration_seconds(text) -> int:
+    """"2小时20分" / "56分20秒" / "24秒" / "上网时长 56分20秒" -> 秒"""
+    raw = str(text or "")
+    if not raw:
+        return 0
+    total = 0
+    found = False
+    for pattern, unit in ((r"(\d+)\s*小时", 3600), (r"(\d+)\s*分", 60), (r"(\d+)\s*秒", 1)):
+        m = re.search(pattern, raw)
+        if m:
+            total += int(m.group(1)) * unit
+            found = True
+    if not found:
+        m = re.search(r"(\d+)", raw)
+        if m and "时" in raw:      # 形如 "17" 小时的合计值
+            total = int(m.group(1)) * 3600
+    return total
+
+
+def _parse_yuan(text) -> float:
+    """费用文本 -> 元: "0元" / "1.50元" / "0" """
+    m = re.search(r"([\d.]+)", str(text or ""))
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _strip_label(text, *labels) -> str:
+    """去掉运营商自带的中文标签: "使用业务: 普通流量" -> "普通流量" """
+    result = str(text or "").strip()
+    for label in labels:
+        if label and result.startswith(label):
+            result = result[len(label):].lstrip(" :：")
+    return result.strip()
+
+
+def _pick_rows(container: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从详单容器里挑出"记录列表" (排除合计/二级明细列表)"""
+    if not isinstance(container, dict):
+        return []
+    for key, value in container.items():
+        if not isinstance(value, list) or not value:
+            continue
+        low = str(key).lower()
+        if "total" in low or "sec" in low:
+            continue
+        if isinstance(value[0], dict):
+            return value
+    return []
+
+
+def _pick_total_items(container: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从详单容器里挑出"合计"块 (title/value/unit 结构的列表)"""
+    if not isinstance(container, dict):
+        return []
+    for key, value in container.items():
+        if isinstance(value, list) and value and isinstance(value[0], dict) and "total" in str(key).lower():
+            return value
+    return []
+
+
+def _total_map(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """合计块 -> 结构化字典 (按 title 归类)；没有任何合计项时返回空字典"""
+    result: Dict[str, Any] = {}
+    if items:
+        result["items"] = items
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if "用量" in title:
+            result["volume"] = str(item.get("value", ""))
+            result["volume_unit"] = str(item.get("unit", ""))
+            result["volume_mb"] = _parse_volume_mb(f"{item.get('value', '')}{item.get('unit', '')}")
+        elif "时长" in title:
+            hours = _parse_yuan(item.get("value"))
+            minutes = _parse_yuan(item.get("subValue"))
+            result["duration_hours"] = int(hours)
+            result["duration_minutes"] = int(minutes)
+            result["duration_seconds"] = int(hours) * 3600 + int(minutes) * 60
+            result["duration"] = f"{int(hours)}小时{int(minutes)}分"
+        elif "费用" in title:
+            result["fee"] = str(item.get("value", ""))
+            result["fee_unit"] = str(item.get("unit", ""))
+            result["fee_yuan"] = _parse_yuan(item.get("value"))
+        elif "条数" in title or "次数" in title or "短信" in title:
+            result["count"] = int(_parse_yuan(item.get("value")))
+            result["count_unit"] = str(item.get("unit", ""))
+    return result
+
+
+def _parse_traffic_detail(container: Dict[str, Any], year: int) -> Dict[str, Any]:
+    """上网流量详单 -> {records(会话明细), daily(按天), total(合计), count}
+
+    实测结构: trafficDetailList[].trafficDetailSecList[] + trafficDetailTotalList[]
+    """
+    records: List[Dict[str, Any]] = []
+    daily: List[Dict[str, Any]] = []
+    for day in _pick_rows(container):
+        date_text = str(day.get("date", "") or "")
+        date_value = _format_detail_date(date_text, year)
+        volume_by_day = str(day.get("volumeByDay", "") or "")
+        daily.append({
+            "date": date_value,
+            "date_text": date_text,
+            "volume": volume_by_day,
+            "volume_mb": _parse_volume_mb(volume_by_day),
+            "duration": str(day.get("durationByDay", "") or ""),
+            "duration_seconds": _parse_duration_seconds(day.get("durationByDay")),
+            "fee": str(day.get("feeByDay", "") or ""),
+            "fee_yuan": _parse_yuan(day.get("feeByDay")),
+            "sessions": len(day.get("trafficDetailSecList") or []),
+        })
+        for row in (day.get("trafficDetailSecList") or []):
+            if not isinstance(row, dict):
+                continue
+            time_text = str(row.get("time", "") or "")
+            records.append({
+                "date": date_value,
+                "time": time_text,
+                "datetime": f"{date_value} {time_text}".strip(),
+                "volume": str(row.get("volume", "") or ""),
+                "volume_mb": _parse_volume_mb(row.get("volume")),
+                "duration": _strip_label(row.get("duration", ""), "上网时长"),
+                "duration_seconds": _parse_duration_seconds(row.get("duration")),
+                "fee": str(row.get("fee", "") or ""),
+                "fee_yuan": _parse_yuan(row.get("fee")),
+                "business_type": _strip_label(row.get("businessType", ""), "使用业务"),
+                "day_volume": volume_by_day,
+            })
+    total = _total_map(_pick_total_items(container))
+    return {"records": records, "daily": daily, "total": total}
+
+
+_SMS_TIME_KEYS = ("time", "callTime", "smsTime", "sendTime", "startTime", "datetime", "date")
+_SMS_NUMBER_KEYS = ("oppositeNumber", "calleNo", "otherNumber", "number", "phoneNumber",
+                    "calledNo", "callNo", "oppositeNo", "peerNumber", "smsNumber")
+_SMS_TYPE_KEYS = ("type", "smsType", "callType", "direction", "sendType", "smsDirection")
+_SMS_COUNT_KEYS = ("count", "smsCount", "amount", "num", "numberCount", "piece")
+_SMS_FEE_KEYS = ("fee", "totalCharge", "charge", "totalFee", "feeByDay")
+_SMS_ALIAS_KEYS = frozenset(
+    _SMS_TIME_KEYS + _SMS_NUMBER_KEYS + _SMS_TYPE_KEYS + _SMS_COUNT_KEYS + _SMS_FEE_KEYS
+)
+_ONLY_TIME_RE = re.compile(r"^\d{1,2}:\d{1,2}(?::\d{1,2})?$")
+
+
+def _first_value(row: Dict[str, Any], keys) -> Any:
+    for key in keys:
+        if row.get(key) not in (None, ""):
+            return row[key]
+    return ""
+
+
+def _nested_rows(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """取按天行里的二级明细列表 (如 *SecList), 没有则返回空"""
+    for key, value in row.items():
+        if isinstance(value, list) and value and isinstance(value[0], dict) and "sec" in str(key).lower():
+            return [v for v in value if isinstance(v, dict)]
+    return []
+
+
+def _normalize_detail_number(raw: Any) -> str:
+    """详单里的号码一律按 ASCIIDencrypt(每字符 -2) 还原 (与通话记录 calleNo 同一套算法)
+
+    还原结果不像号码时退回原值, 避免把明文号码改坏。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    decoded = _ascii_decrypt(text)
+    if re.fullmatch(r"[+\d\-\s]{4,24}", decoded):
+        return decoded.strip()
+    return text
+
+
+def _parse_sms_detail(container: Dict[str, Any], year: int) -> Dict[str, Any]:
+    """短信详单 -> {records, daily, total}
+
+    本机号码当月无短信记录，拿不到真实字段样例，因此按"防御式"解析：
+    - 自动识别容器里的记录列表键（与流量侧对称时是 按天行 + *SecList 二级明细）
+    - 字段用别名表匹配（时间/对端号码/类型/条数/费用），未知字段原样保留
+    - 只有时间(时:分:秒)时, 用所在天的日期补全 datetime
+    """
+    records: List[Dict[str, Any]] = []
+    daily: List[Dict[str, Any]] = []
+    for day in _pick_rows(container):
+        if not isinstance(day, dict):
+            continue
+        date_text = str(day.get("date", "") or "")
+        date_value = _format_detail_date(date_text or _first_value(day, _SMS_TIME_KEYS), year)
+        nested = _nested_rows(day)
+        day_fee_raw = _first_value(day, _SMS_FEE_KEYS)
+        day_count = int(_parse_yuan(_first_value(day, _SMS_COUNT_KEYS)))
+        # 有二级明细时, 按天行的 count/fee 只作为"当日汇总", 不渗进明细
+        if nested or day_count or str(day_fee_raw or "").strip():
+            daily.append({
+                "date": date_value,
+                "date_text": date_text or date_value,
+                "count": day_count or len(nested),
+                "fee": str(day_fee_raw or ""),
+                "fee_yuan": _parse_yuan(day_fee_raw),
+                "items": len(nested),
+            })
+        for item in (nested or [day]):
+            source = dict(item)
+            # 明细里缺日期时, 用所在天补上下文 (只补日期类字段)
+            if not _first_value(source, _SMS_TIME_KEYS) and date_text:
+                source["date"] = date_text
+            time_text = str(_first_value(source, _SMS_TIME_KEYS) or "").strip()
+            if _ONLY_TIME_RE.match(time_text):
+                datetime_text = f"{date_value} {time_text}".strip()
+                row_date = date_value
+            else:
+                datetime_text = _format_detail_time(time_text, year)
+                row_date = _format_detail_date(time_text, year) if datetime_text != time_text else date_value
+            number_raw = str(_first_value(source, _SMS_NUMBER_KEYS) or "")
+            number = _normalize_detail_number(number_raw)
+            record: Dict[str, Any] = {
+                "datetime": datetime_text,
+                "date": row_date,
+                "time": datetime_text[11:] if len(datetime_text) > 10 else "",
+                "phone_number": number,
+                "type": str(_first_value(source, _SMS_TYPE_KEYS) or ""),
+                "count": int(_parse_yuan(_first_value(source, _SMS_COUNT_KEYS))) or 1,
+                "fee": str(_first_value(source, _SMS_FEE_KEYS) or ""),
+                "fee_yuan": _parse_yuan(_first_value(source, _SMS_FEE_KEYS)),
+                "number_location": "",
+                "number_isp": "",
+                "number_location_coordinate": "",
+            }
+            if number_raw and number_raw != number:
+                record["phone_number_raw"] = number_raw
+            # 未知字段原样保留 (便于以后核对真实字段名, 不丢数据)
+            for key, value in source.items():
+                if key in record or key in _SMS_ALIAS_KEYS or isinstance(value, (dict, list)):
+                    continue
+                record[key] = value
+            records.append(record)
+    total = _total_map(_pick_total_items(container))
+    if "count" not in total:
+        total["count"] = sum(r.get("count", 0) for r in records)
+    if "fee_yuan" not in total:
+        total["fee_yuan"] = round(sum(r.get("fee_yuan", 0.0) for r in records), 2)
+    return {"records": records, "daily": daily, "total": total}
 
 
 HOST = "https://appgologinsz.189.cn"
@@ -199,6 +528,34 @@ class TelecomClient:
             _LOGGER.warning("电信接口返回登录态失效: code=%s, reason=%s", code_str, reason_str)
             raise CarrierAuthExpiredError(f"电信登录凭证已失效 ({code_str}: {reason_str})")
         return hdr, res.get("responseData") or {}
+
+    def _query_detail(
+        self, type_value: str, start_date: str, end_date: str, signature: str
+    ) -> Dict[str, Any]:
+        """调用详单接口 query/queryDetailsV2 (返回 responseData)
+
+        type: 1=语音详单 2=短信详单 3=上网流量详单 4=增值业务费 (5 起接口报"第3方系统业务失败")
+        三类详单共用同一次二次认证签名与同一个查询区间 (单月)。
+        """
+        fd = {
+            "account": ENC(self.phone),
+            "queryFlag": "1",
+            "isChinatelecom": "1",
+            "type": str(type_value),
+            "startDate": start_date,
+            "endDate": end_date,
+            "shopId": "20004",
+            "phoneType": "69",
+            "provinceCode": self.province_code,
+            "cityCode": self.city_code,
+            "sortId": "",
+            "validateType": "1",
+            "filterConditions": "",
+            "signatureString": signature,
+            "accessAuth": "0",
+        }
+        _, resp = self._service_post("query/queryDetailsV2", "queryDetailsV2", fd)
+        return resp if isinstance(resp, dict) else {}
 
     def probe_token(self) -> str:
         """轻量探活: 判断当前登录态是否仍然有效 (用于"掉线即自动短信登录")
@@ -977,6 +1334,70 @@ class TelecomClient:
                 data_out["call_auth_remaining_minutes"] = 0
                 data_out["call_start_date"] = display_start_date
                 data_out["call_end_date"] = display_end_date
+
+        # 9. 短信详单 (type=2) 与上网流量详单 (type=3)
+        #    与语音详单共用同一次二次认证、同一个查询区间, 因此不额外发短信、不额外认证
+        auth_ready = bool(auto_signature) and not is_expired
+        auth_text = "已过期 (需重新认证)" if is_expired else "未认证 (需二次认证)"
+        try:
+            from ..phone_region import enrich_number_fields
+        except Exception as err:  # 归属地库不可用时只是少一列信息
+            _LOGGER.debug("归属地库不可用(短信记录将不带归属地): %s", err)
+            enrich_number_fields = None  # type: ignore[assignment]
+
+        for type_value, prefix, container_key, parser, label in (
+            ("2", "sms", "shortMessageDetail", _parse_sms_detail, "短信详单"),
+            ("3", "net", "trafficDetail", _parse_traffic_detail, "上网流量详单"),
+        ):
+            data_out[f"{prefix}_records"] = []
+            data_out[f"{prefix}_count"] = 0
+            data_out[f"{prefix}_daily"] = []
+            data_out[f"{prefix}_total"] = {}
+            data_out[f"{prefix}_last"] = {}
+            data_out[f"{prefix}_start_date"] = display_start_date
+            data_out[f"{prefix}_end_date"] = display_end_date
+            if not auth_ready:
+                data_out[f"{prefix}_status"] = auth_text
+                continue
+            try:
+                resp = self._query_detail(type_value, clean_start_date, end_date_str, auto_signature)
+                inner = resp.get("data") or {}
+                container = inner.get(container_key) or {}
+                result_code = str(resp.get("resultCode") or "")
+                result_desc = str(resp.get("resultDesc") or "")
+                parsed = parser(container, query_year)
+                records = parsed.get("records") or []
+                if prefix == "sms" and records and enrich_number_fields is not None:
+                    # 补对端号码归属地/运营商/坐标 (失败不影响记录本体)
+                    try:
+                        enrich_number_fields(records)
+                    except Exception as err:
+                        _LOGGER.debug("短信记录补充归属地失败(已跳过): %s", err)
+                data_out[f"{prefix}_records"] = records
+                data_out[f"{prefix}_count"] = len(records)
+                data_out[f"{prefix}_daily"] = parsed.get("daily") or []
+                data_out[f"{prefix}_total"] = parsed.get("total") or {}
+                data_out[f"{prefix}_last"] = records[0] if records else {}
+                if prefix == "net":
+                    data_out["net_sort_list"] = inner.get("sortList") or []
+                    data_out["net_filter_list"] = inner.get("filterGroupList") or []
+                if result_code in ("1009", "1010"):
+                    data_out[f"{prefix}_status"] = f"{label}授权已过期 (需重新认证)"
+                elif result_code not in ("0", "0000") and not records:
+                    data_out[f"{prefix}_status"] = f"{label}查询失败 ({result_code} {result_desc})".strip()
+                elif not records:
+                    data_out[f"{prefix}_status"] = "有效 (本区间无记录)"
+                elif remaining_minutes:
+                    data_out[f"{prefix}_status"] = f"有效 (约剩余 {remaining_minutes} 分钟)"
+                else:
+                    data_out[f"{prefix}_status"] = "有效"
+                _LOGGER.debug(
+                    "电信%s拉取: %d 条 (区间 %s -> %s)",
+                    label, len(records), display_start_date, display_end_date,
+                )
+            except Exception as err:
+                data_out[f"{prefix}_status"] = f"查询异常 ({err})"
+                _LOGGER.debug("拉取电信%s异常: %s", label, err)
 
         data_out["location"] = f"{self.province_name} {self.city_name}".strip() or "中国电信"
         data_out["account_status"] = "正常"

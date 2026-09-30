@@ -74,6 +74,42 @@ RECORD_FIELDS = (
     "number_location_coordinate",
     "fee",
 )
+# 短信详单字段 (电信 type=2, 接口容器 shortMessageDetail)
+SMS_RECORD_FIELDS = (
+    "datetime",                     # 归一化时间 "2026-09-30 09:51:03"
+    "date",                         # 日期 "2026-09-30"
+    "time",                         # 时间 "09:51:03"
+    "phone_number",                 # 对端号码 (已按电信 ASCIIDencrypt 还原)
+    "phone_number_raw",             # 接口原始值 (仅当与还原值不同才存在, 便于核对)
+    "type",                         # 发送 / 接收
+    "count",                        # 条数
+    "fee",                          # 费用原文 "0元"
+    "fee_yuan",                     # 费用数值 (元)
+    "number_location",              # 对端号码归属地 (本地库)
+    "number_isp",                   # 对端运营商 (本地库)
+    "number_location_coordinate",   # 对端归属地坐标 "经度,纬度"
+)
+SMS_DAILY_FIELDS = ("date", "date_text", "count", "fee", "fee_yuan", "items")
+
+# 上网流量详单字段 (电信 type=3, 接口容器 trafficDetail)
+NET_RECORD_FIELDS = (
+    "datetime",                     # "2026-09-30 09:51:03"
+    "date",                         # "2026-09-30"
+    "time",                         # "09:51:03"
+    "volume",                       # 本次流量原文 "58.99MB"
+    "volume_mb",                    # 本次流量数值 (MB)
+    "duration",                     # 本次时长原文 "56分20秒"
+    "duration_seconds",             # 本次时长数值 (秒)
+    "fee",                          # 费用原文 "0元"
+    "fee_yuan",                     # 费用数值 (元)
+    "business_type",                # 使用业务 "普通流量"
+    "day_volume",                   # 当日流量合计 (便于单条也带上下文)
+)
+NET_DAILY_FIELDS = (
+    "date", "date_text", "volume", "volume_mb",
+    "duration", "duration_seconds", "fee", "fee_yuan", "sessions",
+)
+
 LEGACY_RECORD_KEYS = {
     "calle_no": "phone_number",
     "call_area": "location",
@@ -102,6 +138,73 @@ def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
         ordered["type"] = "呼叫"
     elif "被叫" in direction:
         ordered["type"] = "接听"
+    return ordered
+
+
+def _ordered_fields(record: Dict[str, Any], fields) -> Dict[str, Any]:
+    """按给定字段顺序整理记录 (缺失填空, 未知字段原样保留)"""
+    merged: Dict[str, Any] = dict(record or {})
+    ordered: Dict[str, Any] = {f: merged.get(f, "") for f in fields}
+    for key, value in merged.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(str(value).strip() or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(float(str(value).strip() or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_sms_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """短信详单记录: 固定字段顺序, 统一短信方向 (发送/接收)"""
+    ordered = _ordered_fields(record, SMS_RECORD_FIELDS)
+    direction = str(ordered.get("type", ""))
+    if "发" in direction or direction == "1":
+        ordered["type"] = "发送"
+    elif "收" in direction or "接" in direction or direction == "2":
+        ordered["type"] = "接收"
+    ordered["count"] = _to_int(ordered.get("count")) or 1
+    ordered["fee_yuan"] = _to_float(ordered.get("fee_yuan"))
+    if not str(ordered.get("datetime", "")).strip() and str(ordered.get("date", "")).strip():
+        ordered["datetime"] = str(ordered.get("date", ""))
+    return ordered
+
+
+def normalize_sms_daily(record: Dict[str, Any]) -> Dict[str, Any]:
+    """短信按天汇总记录"""
+    ordered = _ordered_fields(record, SMS_DAILY_FIELDS)
+    ordered["count"] = _to_int(ordered.get("count"))
+    ordered["fee_yuan"] = _to_float(ordered.get("fee_yuan"))
+    ordered["items"] = _to_int(ordered.get("items"))
+    return ordered
+
+
+def normalize_net_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """上网流量详单记录 (按天汇总里的单次上网会话)"""
+    ordered = _ordered_fields(record, NET_RECORD_FIELDS)
+    ordered["volume_mb"] = round(_to_float(ordered.get("volume_mb")), 4)
+    ordered["fee_yuan"] = _to_float(ordered.get("fee_yuan"))
+    ordered["duration_seconds"] = _to_int(ordered.get("duration_seconds"))
+    return ordered
+
+
+def normalize_net_daily(record: Dict[str, Any]) -> Dict[str, Any]:
+    """上网流量按天汇总记录"""
+    ordered = _ordered_fields(record, NET_DAILY_FIELDS)
+    ordered["volume_mb"] = round(_to_float(ordered.get("volume_mb")), 4)
+    ordered["fee_yuan"] = _to_float(ordered.get("fee_yuan"))
+    ordered["duration_seconds"] = _to_int(ordered.get("duration_seconds"))
+    ordered["sessions"] = _to_int(ordered.get("sessions"))
     return ordered
 
 
@@ -401,6 +504,40 @@ def invalidate_cache() -> None:
         _CACHE["error"] = ""
 
 
+def enrich_number_fields(
+    records: List[Dict[str, Any]],
+    index: Optional[RegionIndex] = None,
+    number_key: str = "phone_number",
+) -> None:
+    """只补"归属地/运营商/坐标"，不改动字段顺序 (通话/短信/流量记录通用, 原地修改)
+
+    - 号码归属地与运营商来自本地 phone2region 库 (库缺失时保持原值)
+    - 坐标来自本地城市坐标表 (格式 "经度,纬度"；不存在该键的记录不会被写入)
+    """
+    if index is None:
+        index = get_index()
+    try:
+        from .city_geo import coordinate_text
+    except Exception as err:  # 坐标表不可用只是少一列信息, 不影响记录本体
+        _LOGGER.debug("坐标表不可用(已跳过坐标补充): %s", err)
+        coordinate_text = None  # type: ignore[assignment]
+
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        if index is not None:
+            info = index.query(record.get(number_key) or record.get("calle_no"))
+            if info:
+                record["number_location"] = info.get("location", "")
+                record["number_isp"] = info.get("isp", "")
+        if coordinate_text is None:
+            continue
+        if "location" in record:
+            record["location_coordinate"] = coordinate_text(record.get("location"))
+        if "number_location" in record:
+            record["number_location_coordinate"] = coordinate_text(record.get("number_location"))
+
+
 def enrich_records(index: Optional[RegionIndex], records: List[Dict[str, Any]]) -> None:
     """为每条通话记录补充 number_location / number_isp (原地修改)
 
@@ -410,25 +547,10 @@ def enrich_records(index: Optional[RegionIndex], records: List[Dict[str, Any]]) 
     for position, record in enumerate(list(records or [])):
         if not isinstance(record, dict):
             continue
-        normalized = normalize_record(record)
-        if index is not None:
-            number = normalized.get("phone_number") or normalized.get("calle_no")
-            info = index.query(number)
-            if info:
-                normalized["number_location"] = info.get("location", "")
-                normalized["number_isp"] = info.get("isp", "")
-        # 补充坐标 (本地城市坐标表, 格式为 "经度,纬度" 字符串; 查不到留空)
-        try:
-            from .city_geo import coordinate_text
-
-            normalized["location_coordinate"] = coordinate_text(normalized.get("location"))
-            normalized["number_location_coordinate"] = coordinate_text(
-                normalized.get("number_location")
-            )
-        except Exception as err:  # 坐标只是附加信息, 不能影响记录本体
-            _LOGGER.debug("补充坐标失败(已跳过): %s", err)
-        # 再整理一次: 保证字段顺序固定为 RECORD_FIELDS
+        # 先按新结构整理 (兼容旧缓存键名), 再补归属地/坐标, 最后再整理一次保证字段顺序
         # (location_coordinate 紧跟 location, number_location_coordinate 在 number_isp 之后)
+        normalized = normalize_record(record)
+        enrich_number_fields([normalized], index)
         records[position] = normalize_record(normalized)
 
 

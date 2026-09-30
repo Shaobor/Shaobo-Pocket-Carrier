@@ -40,6 +40,8 @@ SENSOR_FEE_ROLLOVER = "fee_rollover"    # 上月结转话费
 SENSOR_VOICE_REMAIN = "voice_remain"    # 剩余语音
 SENSOR_VOICE_USED = "voice_used"        # 已用语音
 SENSOR_CALL_RECORD = "call_record"      # 通话记录 (语音详单，需 signatureString)
+SENSOR_SMS_RECORD = "sms_record"        # 短信记录 (短信详单 type=2, 与通话记录共用同一次二次认证)
+SENSOR_NET_RECORD = "net_record"        # 上网记录 (上网流量详单 type=3, 同上)
 
 # 通话流水(语音详单)二次认证控制实体 (仅中国电信)
 # 二次认证三要素: 机主姓名 + 身份证号 + 短信验证码
@@ -112,10 +114,13 @@ OVERVIEW_NODE_ORDER = (
     SENSOR_LOCATION,
     SENSOR_LAST_UPDATE,
     SENSOR_CALL_RECORD,
+    SENSOR_SMS_RECORD,
+    SENSOR_NET_RECORD,
 )
 
-# 通话流水清单属性名 (在总览节点里按上限裁剪)
+# 详单类清单属性名 (在总览节点里按上限裁剪)
 OVERVIEW_CALL_LIST_ATTR = "通话流水清单"
+OVERVIEW_DETAIL_LIST_ATTRS = ("通话流水清单", "短信记录", "上网记录")
 
 # 固定实体 ID 后缀表 (按实体 key)
 # 实体 ID 形如 <domain>.<手机号>_<后缀>，后缀一律使用简短英文单词 (不用拼音)，例如:
@@ -151,6 +156,8 @@ ENTITY_ID_SUFFIXES = {
     SENSOR_VOICE_USED: "voice_used",        # 共享通话已用 / 已用语音
     SENSOR_SMS_REMAIN: "sms",               # 剩余短信
     SENSOR_CALL_RECORD: "calls",            # 通话记录
+    SENSOR_SMS_RECORD: "sms",               # 短信记录
+    SENSOR_NET_RECORD: "traffic",           # 上网记录
     SENSOR_INTEGRAL: "points",              # 积分
     SENSOR_STAR_LEVEL: "star",              # 用户星级
     SENSOR_MEMBER_LEVEL: "level",           # 会员等级
