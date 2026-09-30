@@ -118,9 +118,17 @@ OVERVIEW_NODE_ORDER = (
     SENSOR_NET_RECORD,
 )
 
-# 详单类清单属性名 (在总览节点里按上限裁剪)
+# 清单类属性名 (在总览节点里按「总览保留条数」上限裁剪)
 OVERVIEW_CALL_LIST_ATTR = "通话流水清单"
-OVERVIEW_DETAIL_LIST_ATTRS = ("通话流水清单", "短信记录", "上网记录")
+OVERVIEW_DETAIL_LIST_ATTRS = ("通话流水清单", "短信记录", "上网会话清单", "按天汇总")
+
+# 总览实体里, 详单类节点只搬运这些子属性 (避免把整份属性复制一遍导致总览过大;
+# 单个实体本身仍保留完整属性, 这里只影响「数据总览」这一份聚合数据)
+OVERVIEW_NODE_ATTR_KEYS = {
+    SENSOR_CALL_RECORD: ("通话流水清单",),
+    SENSOR_SMS_RECORD: ("短信记录", "按天汇总"),
+    SENSOR_NET_RECORD: ("上网会话清单", "按天汇总", "合计"),
+}
 
 # 固定实体 ID 后缀表 (按实体 key)
 # 实体 ID 形如 <domain>.<手机号>_<后缀>，后缀一律使用简短英文单词 (不用拼音)，例如:

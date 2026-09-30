@@ -463,6 +463,12 @@ class _DetailRecordSensor(BaseCarrierSensor):
     _list_attr = "短信记录"          # 明细清单属性名
     _daily_attr = "按天汇总"
     _idle_icon = "mdi:file-document-outline"
+    # 属性裁剪: 子类可声明只保留哪些字段 (None = 全部保留)
+    # 元素写法: "字段名" 表示同名取值; ("输出名", "来源字段") 可改名取值 (如 fee 取数值 fee_yuan)
+    _record_projection: Optional[tuple] = None
+    _daily_projection: Optional[tuple] = None
+    # 是否输出"记录条数 / 汇总天数"这类统计 (短信侧由「合计」承担, 不再重复)
+    _show_meta_counts = True
 
     # ---------------- 子类实现 ----------------
     def _normalize_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -476,6 +482,27 @@ class _DetailRecordSensor(BaseCarrierSensor):
 
     def _extra_detail_attrs(self) -> Dict[str, Any]:
         return {}
+
+    def _total_display(self) -> Dict[str, Any]:
+        """「合计」节点内容 (子类可精简)"""
+        return self._total
+
+    @staticmethod
+    def _project(record: Dict[str, Any], fields: Optional[tuple]) -> Dict[str, Any]:
+        """按字段清单裁剪记录 (fields 为 None 时原样返回)
+
+        元素可为 "字段名"(同名取值) 或 ("输出名", "来源字段")(改名/取数值版本),
+        例如 ("fee", "fee_yuan") 让 fee 输出纯数字(元)。
+        """
+        if not fields or not isinstance(record, dict):
+            return record
+        projected: Dict[str, Any] = {}
+        for item in fields:
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                projected[item[0]] = record.get(item[1])
+            else:
+                projected[item] = record.get(item)
+        return projected
 
     # ---------------- 公共数据 ----------------
     @property
@@ -535,7 +562,7 @@ class _DetailRecordSensor(BaseCarrierSensor):
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         records = self._records
-        total = self._total
+        daily = self._daily
         rem_min = self.data.get("call_auth_remaining_minutes", 0)
         from_cache = bool(self.data.get(f"{self._prefix}_data_from_cache"))
         if from_cache:
@@ -554,13 +581,16 @@ class _DetailRecordSensor(BaseCarrierSensor):
             or self.data.get("call_end_date", "该月最后一天"),
             "详单授权状态": self._auth_status,
             "授权剩余有效时长": f"{rem_min} 分钟" if not self.data.get("call_need_auth") else "0 分钟",
-            "记录条数": len(records),
-            "汇总天数": len(self._daily),
-            "合计": total,
-            "按天汇总": self._daily,
-            "最近一条": records[0] if records else {},
-            self._list_attr: records,
         }
+        if self._show_meta_counts:
+            attrs["记录条数"] = len(records)
+            attrs["汇总天数"] = len(daily)
+        attrs.update({
+            "合计": self._total_display(),
+            "按天汇总": [self._project(row, self._daily_projection) for row in daily],
+            "最近一条": self._project(records[0], self._record_projection) if records else {},
+            self._list_attr: [self._project(row, self._record_projection) for row in records],
+        })
         attrs.update(self._extra_detail_attrs())
         if from_cache:
             attrs["缓存说明"] = (
@@ -576,6 +606,16 @@ class TelecomSmsRecordSensor(_DetailRecordSensor):
     _label = "短信"
     _list_attr = "短信记录"
     _idle_icon = "mdi:message-text-clock-outline"
+    # 只保留卡片/自动化真正会用到的字段 (其余信息在原始缓存里, 需要时可随时放开)
+    # fee 取数值版本(fee_yuan), 不带"元"
+    _record_projection = (
+        "datetime", "phone_number", "type", ("fee", "fee_yuan"),
+        "number_location", "number_isp", "number_location_coordinate",
+    )
+    # 每天(按方向)一行: date / count / type / fee(纯数字, 元)
+    _daily_projection = ("date", "count", "type", "fee")
+    # 条数已在「合计」里, 不再重复输出"记录条数/汇总天数"
+    _show_meta_counts = False
 
     def __init__(self, coordinator, phone: str):
         desc = SensorEntityDescription(
@@ -607,9 +647,20 @@ class TelecomSmsRecordSensor(_DetailRecordSensor):
         direction = f"（发 {sent} / 收 {received}）" if (sent or received) else ""
         return f"{self._month_text()} {count} 条{direction} · {float(fee):.2f} 元"
 
-    def _extra_detail_attrs(self) -> Dict[str, Any]:
+    def _total_display(self) -> Dict[str, Any]:
+        """合计: 只给条数(含发送/接收)与金额, 金额为纯数字(元)"""
+        total = self._total
+        count = int(total.get("count") or self.data.get(f"{self._prefix}_count") or len(self._records))
+        fee = total.get("fee_yuan")
+        if fee is None:
+            fee = round(sum(float(r.get("fee_yuan", 0.0) or 0) for r in self._records), 2)
         sent, received = self._counts()
-        return {"发送条数": sent, "接收条数": received}
+        return {
+            "count": count,
+            "sent": sent,
+            "received": received,
+            "fee": round(float(fee), 2),
+        }
 
 
 class TelecomNetRecordSensor(_DetailRecordSensor):
@@ -619,6 +670,14 @@ class TelecomNetRecordSensor(_DetailRecordSensor):
     _label = "上网"
     _list_attr = "上网会话清单"
     _idle_icon = "mdi:chart-timeline-variant"
+    # 会话清单: 只保留时间/流量/时长/费用(纯数字,元)/业务类型
+    _record_projection = (
+        "datetime", "volume_mb", "duration_seconds", ("fee", "fee_yuan"), "business_type",
+    )
+    # 按天汇总: 日期/流量/时长/费用(纯数字,元)/会话数
+    _daily_projection = (
+        "date", "volume_mb", "duration_seconds", ("fee", "fee_yuan"), "sessions",
+    )
 
     def __init__(self, coordinator, phone: str):
         desc = SensorEntityDescription(

@@ -89,7 +89,8 @@ SMS_RECORD_FIELDS = (
     "number_isp",                   # 对端运营商 (本地库)
     "number_location_coordinate",   # 对端归属地坐标 "经度,纬度"
 )
-SMS_DAILY_FIELDS = ("date", "date_text", "count", "fee", "fee_yuan", "items")
+# 短信按天汇总: 每天(按方向)一行, 只保留 4 个字段, fee 为纯数字(元, 不带单位)
+SMS_DAILY_FIELDS = ("date", "count", "type", "fee")
 
 # 上网流量详单字段 (电信 type=3, 接口容器 trafficDetail)
 NET_RECORD_FIELDS = (
@@ -141,6 +142,43 @@ def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return ordered
 
 
+def ascii_decrypt(raw: Any) -> str:
+    """电信 App 的 ASCIIDencrypt 还原: 每一位字符的 ASCII 码减 2
+
+    号码类字段在接口里一律这样处理过，例如 "35585;24;83" -> "13363902961"。
+    """
+    text = str(raw or "")
+    if not text:
+        return ""
+    try:
+        return "".join(chr(ord(char) - 2) for char in text)
+    except Exception:
+        return text
+
+
+def decrypt_number(raw: Any) -> str:
+    """还原号码并做安全校验: 还原结果不像号码时退回原值 (避免把明文改坏)"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    decoded = ascii_decrypt(text)
+    if re.fullmatch(r"[+\d\-\s]{4,24}", decoded):
+        return decoded.strip()
+    return text
+
+
+# 短信详单里"对端号码"可能出现的原始字段名 (实测电信返回 sendNo / receiveNo)
+SMS_NUMBER_SOURCE_KEYS = (
+    "sendNo", "receiveNo", "showNo", "otherNo", "contactNo",
+    "oppositeNumber", "oppositeNo", "otherNumber", "peerNumber",
+    "calleNo", "calledNo", "callNo", "phoneNumber", "smsNumber", "number",
+)
+# 短信详单里的"短信类型"原始字段名 (实测返回 shortMessageType: 发送短信)
+SMS_TYPE_SOURCE_KEYS = ("shortMessageType", "smsType", "type", "callType", "direction", "sendType")
+# 只做展示、没有信息量的字段 (不写进记录, 避免污染属性)
+SMS_NOISE_KEYS = ("icon",)
+
+
 def _ordered_fields(record: Dict[str, Any], fields) -> Dict[str, Any]:
     """按给定字段顺序整理记录 (缺失填空, 未知字段原样保留)"""
     merged: Dict[str, Any] = dict(record or {})
@@ -165,14 +203,49 @@ def _to_int(value: Any) -> int:
         return 0
 
 
-def normalize_sms_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    """短信详单记录: 固定字段顺序, 统一短信方向 (发送/接收)"""
-    ordered = _ordered_fields(record, SMS_RECORD_FIELDS)
-    direction = str(ordered.get("type", ""))
+def sms_direction(raw: Any) -> str:
+    """短信方向归一化: "发送短信"/"1" -> 发送; "接收短信"/"2" -> 接收; 未知原样返回"""
+    direction = str(raw or "").strip()
+    if not direction:
+        return ""
     if "发" in direction or direction == "1":
-        ordered["type"] = "发送"
-    elif "收" in direction or "接" in direction or direction == "2":
-        ordered["type"] = "接收"
+        return "发送"
+    if "收" in direction or "接" in direction or direction == "2":
+        return "接收"
+    return direction
+
+
+def normalize_sms_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """短信详单记录: 固定字段顺序, 统一短信方向 (发送/接收), 还原对端号码
+
+    号码兼容两层:
+    - 新解析的记录已带 phone_number; 早期版本解析或历史缓存可能只留下原始字段
+      (如 sendNo/receiveNo)，这里按 ASCIIDencrypt 补还原, 所以老缓存也能显示号码。
+    """
+    ordered = _ordered_fields(record, SMS_RECORD_FIELDS)
+
+    # 短信方向: 原始值可能是 "发送短信"/"接收短信"/"1"/"2"
+    direction = str(ordered.get("type", ""))
+    for key in SMS_TYPE_SOURCE_KEYS:
+        if not direction and ordered.get(key):
+            direction = str(ordered.get(key))
+            break
+    ordered["type"] = sms_direction(direction) or str(ordered.get("type") or "")
+
+    # 对端号码: 缺失时从原始字段还原 (老缓存同样是加密值)
+    if not str(ordered.get("phone_number", "")).strip():
+        for key in SMS_NUMBER_SOURCE_KEYS:
+            raw = ordered.get(key)
+            if raw not in (None, ""):
+                ordered["phone_number_raw"] = str(raw)
+                ordered["phone_number"] = decrypt_number(raw)
+                break
+    elif not str(ordered.get("phone_number_raw", "")).strip():
+        ordered.pop("phone_number_raw", None)
+
+    for key in SMS_NOISE_KEYS:
+        ordered.pop(key, None)
+
     ordered["count"] = _to_int(ordered.get("count")) or 1
     ordered["fee_yuan"] = _to_float(ordered.get("fee_yuan"))
     if not str(ordered.get("datetime", "")).strip() and str(ordered.get("date", "")).strip():
@@ -181,11 +254,11 @@ def normalize_sms_record(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_sms_daily(record: Dict[str, Any]) -> Dict[str, Any]:
-    """短信按天汇总记录"""
+    """短信按天汇总记录: date / count / type / fee(纯数字, 元)"""
     ordered = _ordered_fields(record, SMS_DAILY_FIELDS)
     ordered["count"] = _to_int(ordered.get("count"))
-    ordered["fee_yuan"] = _to_float(ordered.get("fee_yuan"))
-    ordered["items"] = _to_int(ordered.get("items"))
+    ordered["type"] = sms_direction(ordered.get("type")) or str(ordered.get("type") or "")
+    ordered["fee"] = round(_to_float(ordered.get("fee")), 2)
     return ordered
 
 
