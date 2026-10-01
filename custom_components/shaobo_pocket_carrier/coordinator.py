@@ -5,7 +5,7 @@ import logging
 import datetime
 import time
 from datetime import timedelta
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -31,7 +31,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL_UNICOM,
 )
 from .api.telecom import TelecomClient
-from .api.unicom import UnicomClient
+from .api.unicom import UnicomClient, month_range, resolve_query_month
 from .storage import async_save_carrier_account, CallRecordCache
 
 _LOGGER = logging.getLogger(__name__)
@@ -472,6 +472,13 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
         self.phone = phone
         self.entry = entry
         self.client = UnicomClient(phone, auth_data)
+        # 通话流水本地缓存 (.storage/Shaobo_CallRecords)，认证失效/未更新时兜底展示历史流水
+        self.call_cache = CallRecordCache(hass, CARRIER_UNICOM, phone)
+        # 下一轮刷新强制拉取详单 (「刷新详单流水」按钮 / 修改查询起始日期等主动操作)，
+        # 不受「自动获取通话记录」开关限制，用后即清
+        self._force_detail_fetch = False
+        # 当前展示的详单所属月份 (YYYY-MM)；None = 尚未从本地缓存读取
+        self._detail_month: Optional[str] = None
         interval_min = DEFAULT_SCAN_INTERVAL_UNICOM
         if entry:
             try:
@@ -488,13 +495,204 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=interval_min),
         )
 
+    @property
+    def auto_query_enabled(self) -> bool:
+        """「自动获取通话记录」开关是否开启 (开关实体恢复状态之前视为关闭)"""
+        store = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id) if self.entry else None
+        runtime = store.get("auth_runtime") if isinstance(store, dict) else None
+        return bool(getattr(runtime, "auto_query_enabled", False))
+
+    def request_detail_fetch(self) -> None:
+        """让下一轮刷新强制拉取三类详单 (不受「自动获取通话记录」开关限制)"""
+        self._force_detail_fetch = True
+
+    async def async_refresh_details(self) -> bool:
+        """立即刷新一次并强制拉取详单，返回是否刷新成功"""
+        self.request_detail_fetch()
+        await self.async_refresh()
+        return self.last_update_success
+
+    async def _async_sync_call_record_cache(self, data: Dict[str, Any], query_month: str) -> None:
+        """同步联通通话/短信/上网三类详单的本地缓存 (拉到记录时落盘，失效或空时用本地缓存兜底)
+
+        兜底只用查询月份 (YYYY-MM) 相同的缓存: 月初还没有新流水时，
+        不能把上个月的缓存当成本月数据展示。
+        """
+        try:
+            raw_records = list(data.get("call_records") or [])
+            sms_records = list(data.get("sms_records") or [])
+            net_records = list(data.get("net_records") or [])
+
+            if raw_records or sms_records or net_records:
+                # 按照通话时间倒序排序
+                if raw_records:
+                    raw_records.sort(key=lambda r: str(r.get("call_time", "")), reverse=True)
+                first = raw_records[0] if raw_records else {}
+                last = raw_records[-1] if raw_records else {}
+                signature = [
+                    len(raw_records),
+                    str(first.get("call_time", "")),
+                    str(last.get("call_time", "")),
+                    len(sms_records),
+                    len(net_records),
+                    str(data.get("call_start_date", "")),
+                    str(data.get("call_end_date", "")),
+                ]
+                cached = await self.call_cache.async_load()
+                if cached.get("signature") == signature:
+                    return
+
+                payload = {
+                    "signature": signature,
+                    "records": raw_records[:CALL_CACHE_MAX_RECORDS],
+                    "call_count": data.get("call_count", len(raw_records)),
+                    "last_call": raw_records[0] if raw_records else {},
+                    "start_date": str(data.get("call_start_date", "")),
+                    "end_date": str(data.get("call_end_date", "")),
+                    # 短信详单
+                    "sms_records": sms_records[:CALL_CACHE_MAX_RECORDS],
+                    "sms_count": data.get("sms_count", len(sms_records)),
+                    "sms_daily": data.get("sms_daily") or [],
+                    "sms_total": data.get("sms_total") or {},
+                    "sms_last": data.get("sms_last") or (sms_records[0] if sms_records else {}),
+                    "sms_start_date": str(data.get("sms_start_date", "")),
+                    "sms_end_date": str(data.get("sms_end_date", "")),
+                    # 上网流量详单
+                    "net_records": net_records[:CALL_CACHE_MAX_RECORDS],
+                    "net_count": data.get("net_count", len(net_records)),
+                    "net_daily": data.get("net_daily") or [],
+                    "net_total": data.get("net_total") or {},
+                    "net_last": data.get("net_last") or (net_records[0] if net_records else {}),
+                    "net_start_date": str(data.get("net_start_date", "")),
+                    "net_end_date": str(data.get("net_end_date", "")),
+                }
+                await self.call_cache.async_save(payload)
+                _LOGGER.debug(
+                    "联通手机号 %s 详单已写入本地缓存 (通话 %d 条 / 短信 %d 条 / 上网 %d 条)",
+                    self.phone, len(raw_records), len(sms_records), len(net_records),
+                )
+                return
+
+            # 无实时数据时用本地缓存兜底 (只用同月缓存，区间按查询月份重新计算，兼容旧格式缓存)
+            cached = await self.call_cache.async_load()
+            saved_text = cached.get("saved_at_text", "")
+            range_start, range_end = month_range(query_month[:4], query_month[5:7])
+            # 本轮没拉详单时数据里没有区间，补上查询月份的区间 (否则传感器显示"当月月初")
+            for prefix in ("call", "sms", "net"):
+                data.setdefault(f"{prefix}_start_date", range_start)
+                data.setdefault(f"{prefix}_end_date", range_end)
+            # 本轮没拉详单时，同月缓存里的空清单也要用上 (= 上次拉取时该月就没有记录)，
+            # 否则会被误显示成"未获取"
+            paused = bool(data.get("detail_fetch_paused"))
+
+            # 1. 通话记录兜底
+            records = cached.get("records") or []
+            same_month = str(cached.get("start_date") or "")[:7] == query_month
+            if (records or paused) and not data.get("call_records") and same_month:
+                if records:
+                    try:
+                        from .phone_region import enrich_records, get_index
+                        enrich_records(get_index(), records)
+                    except Exception as err:
+                        _LOGGER.debug("整理联通缓存流水失败: %s", err)
+                data["call_records"] = records
+                data["call_count"] = cached.get("call_count") or len(records)
+                data["last_call"] = cached.get("last_call") or (records[0] if records else {})
+                data["call_data_from_cache"] = True
+                data["call_cache_saved_at_text"] = saved_text
+                _LOGGER.debug("联通手机号 %s 使用本地缓存兜底通话记录 (%d 条)", self.phone, len(records))
+
+            # 2. 短信详单与上网详单兜底
+            for prefix in ("sms", "net"):
+                c_records = cached.get(f"{prefix}_records") or []
+                same_month = str(cached.get(f"{prefix}_start_date") or "")[:7] == query_month
+                if (c_records or paused) and not data.get(f"{prefix}_records") and same_month:
+                    data[f"{prefix}_records"] = c_records
+                    data[f"{prefix}_count"] = cached.get(f"{prefix}_count") or len(c_records)
+                    data[f"{prefix}_daily"] = cached.get(f"{prefix}_daily") or []
+                    data[f"{prefix}_total"] = cached.get(f"{prefix}_total") or {}
+                    data[f"{prefix}_last"] = cached.get(f"{prefix}_last") or (c_records[0] if c_records else {})
+                    data[f"{prefix}_data_from_cache"] = True
+                    data[f"{prefix}_cache_saved_at_text"] = saved_text
+                    _LOGGER.debug("联通手机号 %s 使用本地缓存兜底%s记录 (%d 条)", self.phone, prefix, len(c_records))
+        except Exception as err:
+            _LOGGER.debug("同步联通详单记录缓存异常: %s", err)
+
     async def _async_update_data(self) -> Dict[str, Any]:
         """异步拉取联通数据并执行 3 分钟 onLine.htm 滚动保活"""
+        if not getattr(self, "_last_metrics_loaded", False):
+            try:
+                from .storage import async_load_carrier_metrics
+                cached_metrics = await async_load_carrier_metrics(self.hass, CARRIER_UNICOM, self.phone)
+                if cached_metrics and isinstance(cached_metrics, dict):
+                    if not hasattr(self, "last_valid_metrics"):
+                        self.last_valid_metrics = {}
+                    self.last_valid_metrics.update(cached_metrics)
+                self._last_metrics_loaded = True
+            except Exception as err:
+                _LOGGER.debug("加载持久化有效指标失败: %s", err)
+
+        start_date = ""
+        if self.entry:
+            start_date = str(self.entry.options.get(CONF_CALL_START_DATE, "") or "").strip()
+            if start_date == datetime.date.today().replace(day=1).strftime("%Y-%m-%d"):
+                start_date = ""
+
+        # 联通按自然月查询详单
+        yyyy, mm, _dd = resolve_query_month(start_date)
+        query_month = f"{yyyy}-{mm}"
+        if self._detail_month is None:
+            cached = await self.call_cache.async_load()
+            self._detail_month = str(cached.get("start_date") or "")[:7]
+
+        # 以下情况拉取详单，否则只刷新话费/流量，详单用同月的本地缓存展示:
+        # 「自动获取通话记录」开启 / 主动请求 (刷新详单流水、改日期) /
+        # 查询月份与当前展示的详单不是同一个月 (改日期、每日重置、跨月)，保证日期与详单对得上
+        fetch_details = (
+            self._force_detail_fetch
+            or self.auto_query_enabled
+            or query_month != self._detail_month
+        )
+        self._force_detail_fetch = False
+
         try:
-            data = await self.hass.async_add_executor_job(self.client.fetch_all_data)
+            data = await self.hass.async_add_executor_job(
+                self.client.fetch_all_data, start_date, fetch_details
+            )
             if not data or not isinstance(data, dict):
                 raise UpdateFailed("联通接口返回空数据")
-            
+
+            # 出账期/接口异常防抖保护:
+            # 联通每月1日 0:00-8:00 是月结锁账期，接口锁定返回 canusefeecust: 0.00 / curntbalancecust: "--"
+            # 此时绝不能将正常话费清空覆盖为 0，必须平滑继承上一次有效余额
+            is_limit = data.get("is_limit_period") is True
+            balance_fetched = data.get("balance_fetched") is True
+            cur_bal = data.get("balance", 0.0)
+
+            if not hasattr(self, "last_valid_metrics"):
+                self.last_valid_metrics = {}
+
+            last_bal = self.last_valid_metrics.get("balance")
+            if (not balance_fetched or (is_limit and cur_bal == 0.0)) and last_bal is not None:
+                data["balance"] = last_bal
+                data["balance_source"] = "出账期保留历史有效余额"
+                data["limit_period_notice"] = "每月1日0点至8点系统出账期 (当前展示出账前有效余额)"
+                _LOGGER.info("联通手机号 %s 处于月初出账期，平滑继承有效话费余额: %s 元", self.phone, last_bal)
+            elif balance_fetched and cur_bal != 0.0:
+                self.last_valid_metrics["balance"] = cur_bal
+                try:
+                    from .storage import async_save_carrier_metrics
+                    await async_save_carrier_metrics(self.hass, CARRIER_UNICOM, self.phone, self.last_valid_metrics)
+                except Exception as err:
+                    _LOGGER.debug("持久化有效指标失败: %s", err)
+
+            # 通话流水本地缓存同步 (成功拉取时落盘，失效/空/本轮未拉取时用同月缓存兜底)
+            if not fetch_details:
+                data["detail_fetch_paused"] = True
+            await self._async_sync_call_record_cache(data, query_month)
+            if fetch_details:
+                self._detail_month = query_month
+
             # 若有新的 token_online，可平滑更新 entry.data 与专属 storage 文件
             if self.entry and self.client.token_online:
                 new_auth = self.client.export_auth()

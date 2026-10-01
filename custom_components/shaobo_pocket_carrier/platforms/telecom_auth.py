@@ -24,7 +24,7 @@ import calendar
 import datetime
 import logging
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
 from homeassistant.components.date import DateEntity
@@ -36,9 +36,11 @@ from homeassistant.core import HomeAssistant, callback
 from ..const import (
     CALL_AUTH_EXPIRE_SECONDS,
     CALL_AUTH_WAIT_SECONDS,
+    CARRIER_UNICOM,
     CONF_AUTH_ID_CARD,
     CONF_AUTH_USER_NAME,
     CONF_CALL_START_DATE,
+    CONF_CARRIER,
     CONF_PHONE,
     CONF_SIGNATURE_STRING,
     CONF_SIGNATURE_TIMESTAMP,
@@ -519,7 +521,7 @@ class TelecomCallQueryStartDate(_TelecomCallAuthEntity, DateEntity):
         start = self._current_start_date()
         _, last_day = calendar.monthrange(start.year, start.month)
         raw = str(self.entry.options.get(CONF_CALL_START_DATE, "") or "").strip()
-        return {
+        attrs: Dict[str, Any] = {
             "用途": "通话流水(语音详单)查询起始日期，截止日期自动取该月最后一天",
             "所属月份": f"{start.year}年{start.month}月",
             "该月截止日期": f"{start.year:04d}-{start.month:02d}-{last_day:02d}",
@@ -533,6 +535,15 @@ class TelecomCallQueryStartDate(_TelecomCallAuthEntity, DateEntity):
                 "若授权已过期，再按一次「通话详单二次认证」按钮即可发码并自动完成认证"
             ),
         }
+        if self.entry.data.get(CONF_CARRIER) == CARRIER_UNICOM:
+            # 联通详单无需二次认证，且接口只支持按自然月查询
+            attrs.pop("详单授权状态")
+            attrs["用途"] = "通话/短信/上网详单的查询月份：联通接口按自然月查询，选该月任意一天都查询整月"
+            attrs["使用说明"] = (
+                "写入任意日期会立即拉取一次该月详单 (不受「自动获取通话记录」开关限制)；"
+                "「每日重置查询起始日期」开启时每天 06:00 自动回到当月"
+            )
+        return attrs
 
     async def async_set_value(self, value: datetime.date) -> None:
         """写入查询起始日期并触发一次数据请求"""
@@ -543,6 +554,10 @@ class TelecomCallQueryStartDate(_TelecomCallAuthEntity, DateEntity):
         # 与选项流规则保持一致: 选当月 1 日表示"动态跟随当月", 存空值, 跨月自动滚动
         stored = "" if value == today_first else value.isoformat()
 
+        # 改日期属于主动查询: 联通即使关闭了「自动获取通话记录」，这一轮刷新也要拉详单
+        if self.entry.data.get(CONF_CARRIER) == CARRIER_UNICOM:
+            self._coordinator.request_detail_fetch()
+
         try:
             new_options = dict(self.entry.options)
             if str(new_options.get(CONF_CALL_START_DATE, "") or "").strip() != stored:
@@ -550,7 +565,7 @@ class TelecomCallQueryStartDate(_TelecomCallAuthEntity, DateEntity):
                 self.hass.config_entries.async_update_entry(self.entry, options=new_options)
                 # 选项变更监听器会立即刷新一次数据 (不重载整条集成)
                 _LOGGER.info(
-                    "电信手机号 %s 通话详单查询起始日期已设为 %s",
+                    "手机号 %s 通话详单查询起始日期已设为 %s",
                     self.phone,
                     stored or f"跟随当月 ({today_first.isoformat()})",
                 )

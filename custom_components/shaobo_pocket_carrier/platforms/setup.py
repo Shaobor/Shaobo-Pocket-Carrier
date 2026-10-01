@@ -35,6 +35,7 @@ from .telecom_auth import (
     create_call_query_start_date_entity,
 )
 from .telecom_sensor import get_telecom_sensors
+from .unicom_detail import create_detail_refresh_button
 from .unicom_sensor import get_unicom_sensors
 
 _LOGGER = logging.getLogger(__name__)
@@ -109,20 +110,20 @@ async def async_setup_carrier_buttons(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """按钮平台: 仅中国电信需要通话详单二次认证按钮"""
+    """按钮平台: 归属地库更新按钮通用; 电信: 通话详单二次认证按钮; 联通: 刷新详单流水按钮"""
     context = get_carrier_context(hass, entry)
-    if context is None or context[1] != CARRIER_TELECOM:
+    if context is None:
         return
-    coordinator, _carrier, phone = context
+    coordinator, carrier, phone = context
 
-    _LOGGER.debug("正在为电信手机号 %s 注册通话详单二次认证按钮实体", phone)
-    async_add_entities(
-        [
-            create_call_auth_button_entity(hass, coordinator, phone, entry),
-            create_region_update_button(hass, coordinator, phone, entry),
-        ],
-        update_before_add=False,
-    )
+    buttons = [create_region_update_button(hass, coordinator, phone, entry)]
+    if carrier == CARRIER_TELECOM:
+        buttons.append(create_call_auth_button_entity(hass, coordinator, phone, entry))
+    elif carrier == CARRIER_UNICOM:
+        buttons.append(create_detail_refresh_button(hass, coordinator, phone, entry))
+
+    _LOGGER.debug("正在为 %s 手机号 %s 注册按钮实体 (共 %d 个)", carrier, phone, len(buttons))
+    async_add_entities(buttons, update_before_add=False)
 
 
 async def async_setup_carrier_dates(
@@ -130,13 +131,13 @@ async def async_setup_carrier_dates(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """日期平台: 仅中国电信需要通话详单查询起始日期"""
+    """日期平台: 通话详单查询起始日期 (电信/联通通用)"""
     context = get_carrier_context(hass, entry)
-    if context is None or context[1] != CARRIER_TELECOM:
+    if context is None:
         return
-    coordinator, _carrier, phone = context
+    coordinator, carrier, phone = context
 
-    _LOGGER.debug("正在为电信手机号 %s 注册通话详单查询起始日期实体", phone)
+    _LOGGER.debug("正在为 %s 手机号 %s 注册通话详单查询起始日期实体", carrier, phone)
     async_add_entities(
         [create_call_query_start_date_entity(hass, coordinator, phone, entry)],
         update_before_add=False,
@@ -148,22 +149,22 @@ async def async_setup_carrier_switches(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """开关平台: 仅中国电信需要自动短信登录 / 自动获取通话记录 / 每日重置查询起始日期开关"""
+    """开关平台: 自动获取通话记录 / 每日重置查询起始日期 / 自动更新归属地库 (通用); 自动短信登录 (仅电信)"""
     context = get_carrier_context(hass, entry)
-    if context is None or context[1] != CARRIER_TELECOM:
+    if context is None:
         return
-    coordinator, _carrier, phone = context
+    coordinator, carrier, phone = context
 
-    _LOGGER.debug("正在为电信手机号 %s 注册自动登录、自动获取与每日重置开关", phone)
-    async_add_entities(
-        [
-            create_auto_login_switch(hass, coordinator, phone, entry),
-            create_auto_query_switch(hass, coordinator, phone, entry),
-            create_daily_reset_switch(hass, coordinator, phone, entry),
-            create_region_auto_switch(hass, coordinator, phone, entry),
-        ],
-        update_before_add=False,
-    )
+    switches = [
+        create_auto_query_switch(hass, coordinator, phone, entry),
+        create_daily_reset_switch(hass, coordinator, phone, entry),
+        create_region_auto_switch(hass, coordinator, phone, entry),
+    ]
+    if carrier == CARRIER_TELECOM:
+        switches.append(create_auto_login_switch(hass, coordinator, phone, entry))
+
+    _LOGGER.debug("正在为 %s 手机号 %s 注册开关实体 (共 %d 个)", carrier, phone, len(switches))
+    async_add_entities(switches, update_before_add=False)
 
 
 async def async_setup_carrier_times(
@@ -171,13 +172,13 @@ async def async_setup_carrier_times(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """时间平台: 仅中国电信需要自动获取通话记录时间"""
+    """时间平台: 自动获取通话记录时间 (电信/联通通用)"""
     context = get_carrier_context(hass, entry)
-    if context is None or context[1] != CARRIER_TELECOM:
+    if context is None:
         return
-    coordinator, _carrier, phone = context
+    coordinator, carrier, phone = context
 
-    _LOGGER.debug("正在为电信手机号 %s 注册自动获取通话记录时间实体", phone)
+    _LOGGER.debug("正在为 %s 手机号 %s 注册自动获取通话记录时间实体", carrier, phone)
     async_add_entities(
         [create_auto_query_time(hass, coordinator, phone, entry)],
         update_before_add=False,

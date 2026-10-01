@@ -164,7 +164,7 @@ class RegionDbAutoUpdateSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity
 
     @property
     def is_on(self) -> bool:
-        return bool(self._runtime.auto_region_update_enabled)
+        return self._runtime.auto_region_update_enabled
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:

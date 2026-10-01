@@ -15,7 +15,14 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo, Entity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from ..const import DOMAIN, CARRIER_NAMES, CARRIER_TELECOM, ENTITY_ID_SUFFIXES, SENSOR_ONLINE
+from ..const import (
+    DOMAIN,
+    CARRIER_NAMES,
+    CARRIER_TELECOM,
+    CONF_CARRIER,
+    ENTITY_ID_SUFFIXES,
+    SENSOR_ONLINE,
+)
 from .auth_runtime import async_get_auth_runtime
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,7 +101,7 @@ class CarrierControlEntity(ForcedEntityIdMixin, Entity):
         name: str,
         icon: str,
         platform_domain: str = "text",
-        carrier: str = CARRIER_TELECOM,
+        carrier: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._coordinator = coordinator
@@ -104,7 +111,8 @@ class CarrierControlEntity(ForcedEntityIdMixin, Entity):
         self._removed = False
         self._attr_name = name
         self._attr_icon = icon
-        # carrier 默认电信 (控制类实体目前仅电信使用)，留参数以便将来联通复用时不冲突
+        # 运营商以配置条目为准 (电信/联通共用控制类实体)，与传感器归到同一台设备下
+        carrier = carrier or entry.data.get(CONF_CARRIER) or CARRIER_TELECOM
         self._attr_unique_id = f"{DOMAIN}_{carrier}_{phone}_{key}"
         self._attr_device_info = build_device_info(carrier, phone)
         self._setup_forced_entity_id(platform_domain, phone, key)

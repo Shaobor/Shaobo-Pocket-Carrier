@@ -56,6 +56,7 @@ ENTITY_REGION_AUTO_SWITCH = "region_auto_update"      # switch: 自动检查并�
 ENTITY_AUTO_LOGIN_SWITCH = "auto_login_switch"      # switch: 登录失效后自动短信登录
 ENTITY_AUTO_QUERY_SWITCH = "auto_query_switch"      # switch: 自动获取通话记录 (定时 + 登录后)
 ENTITY_AUTO_QUERY_TIME = "auto_query_time"          # time: 每日自动获取通话记录的时间
+ENTITY_DETAIL_REFRESH_BUTTON = "detail_refresh"     # button: 刷新详单流水 (仅联通，联通详单无需二次认证)
 
 CALL_AUTH_WAIT_SECONDS = 180    # 详单验证码等待窗口 (下发后等待写入并自动提交的最长秒数)
 LOGIN_SMS_WAIT_SECONDS = 180    # 登录验证码等待窗口
@@ -151,6 +152,8 @@ ENTITY_ID_SUFFIXES = {
     ENTITY_AUTO_LOGIN_SWITCH: "auto_login",
     ENTITY_AUTO_QUERY_SWITCH: "auto_query",
     ENTITY_AUTO_QUERY_TIME: "auto_query_time",
+    # 与电信二次认证按钮同后缀 (两者各自只在本运营商创建)，前端卡片按同一个实体 ID 调用
+    ENTITY_DETAIL_REFRESH_BUTTON: "button",
     # 传感器实体 (简短英文单词)
     SENSOR_OVERVIEW: "overview",            # 数据总览
     SENSOR_BALANCE: "balance",              # 话费余额
@@ -162,7 +165,7 @@ ENTITY_ID_SUFFIXES = {
     SENSOR_FEE_ROLLOVER: "rollover",        # 上月结转话费
     SENSOR_VOICE_REMAIN: "voice",           # 共享通话剩余 / 剩余语音
     SENSOR_VOICE_USED: "voice_used",        # 共享通话已用 / 已用语音
-    SENSOR_SMS_REMAIN: "sms",               # 剩余短信
+    SENSOR_SMS_REMAIN: "sms_remain",        # 剩余短信
     SENSOR_CALL_RECORD: "calls",            # 通话记录
     SENSOR_SMS_RECORD: "sms",               # 短信记录
     SENSOR_NET_RECORD: "traffic",           # 上网记录

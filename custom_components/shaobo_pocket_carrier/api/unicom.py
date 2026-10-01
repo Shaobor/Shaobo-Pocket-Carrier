@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 """中国联通 13.1 核心客户端"""
 import base64
+import calendar
+import datetime
 import json
 import logging
 import os
 import random
+import re
 import string
 import time
 import uuid
 import urllib.parse
 import requests
+from typing import Any, Dict, List, Optional, Tuple
 from Crypto.Cipher import PKCS1_v1_5, AES
 from Crypto.PublicKey import RSA
 
@@ -29,12 +33,53 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDc+CZK9bBA9IU+gZUOc6FUGu7yO
 zMeQlEC2czEMSwIDAQAB
 -----END PUBLIC KEY-----"""
 
+# 联通通话/详单查询专用 1024-bit RSA 公钥 (提取自官方详单小程序 94d97cf6)
+XIANGDAN_RSA_KEY = """-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCGc1p5ic36B3FAxvs0dO7KR+YMhkQfsLZZlWT2MtE8ONKPbK7MkKJa47uWO79SwhDHhEr5YU/j92q6UTdk9QIgPmZTMK44E/YBp+xruYyCb0ExqIO7F3+/gNO+UVtFCqP1eO9xj700Ztl3KPvwNW4+Ce/dbiOC+YdHZcq82s6yNQIDAQAB
+-----END PUBLIC KEY-----"""
+
 def rsa_old(v: str) -> str:
     c = PKCS1_v1_5.new(RSA.import_key(LOGIN_RSA_KEY))
     return urllib.parse.quote(base64.b64encode(c.encrypt(v.encode())).decode(), safe="")
 
+def rsa_encrypt_xiangdan(text: str) -> str:
+    """联通详单专用 RSA 加密 (PKCS1Padding) -> Base64 编码"""
+    c = PKCS1_v1_5.new(RSA.import_key(XIANGDAN_RSA_KEY))
+    return base64.b64encode(c.encrypt(text.encode("utf-8"))).decode("utf-8")
+
+def enrich_call_records(records) -> None:
+    """用本地 phone2region 归属地库补充 number_location / number_isp / coordinate"""
+    try:
+        from ..phone_region import enrich_records, get_index
+        enrich_records(get_index(), records)
+    except Exception as err:
+        _LOGGER.debug("补充号码归属地失败(已跳过): %s", err)
+
+def resolve_query_month(start_date: str = "") -> Tuple[str, str, str]:
+    """把「查询起始日期」解析为详单接口参数 (yyyy, mm, dd)
+
+    联通三类详单接口都按自然月查询 (queryMonthAndDay=month)，日期只决定查哪个月，
+    选该月任意一天都返回整月；dd 取当月的今天、历史月的最后一天。
+    格式兼容 2026-08-01 / 2026/8/1 / 2026-08，空值、无法解析或月份非法时取当月 (与电信一致)。
+    """
+    today = datetime.date.today()
+    year, month = today.year, today.month
+    matched = re.match(r"^(\d{4})[-/.]?(\d{1,2})", (start_date or "").strip())
+    if matched and 1 <= int(matched.group(2)) <= 12:
+        year, month = int(matched.group(1)), int(matched.group(2))
+    if (year, month) == (today.year, today.month):
+        day = today.day
+    else:
+        day = calendar.monthrange(year, month)[1]
+    return f"{year:04d}", f"{month:02d}", f"{day:02d}"
+
+def month_range(yyyy: str, mm: str) -> Tuple[str, str]:
+    """查询月份的展示区间: 该月 1 日 ~ 该月最后一天 (接口按整月返回；与电信一样截止日取月末)"""
+    last_day = calendar.monthrange(int(yyyy), int(mm))[1]
+    return f"{yyyy}-{mm}-01", f"{yyyy}-{mm}-{last_day:02d}"
+
 class UnicomClient:
-    def __init__(self, phone: str, auth_data: dict = None):
+    def __init__(self, phone: str, auth_data: Optional[dict] = None):
         self.phone = phone
         self.s = requests.Session()
         self.s.headers.update({
@@ -125,9 +170,6 @@ class UnicomClient:
             err_msg = j.get("desc") or j.get("message") or j.get("code") or "滑块验证未通过"
             return False, f"滑块校验失败: {err_msg}"
 
-            err_msg = j.get("desc") or j.get("message") or j.get("code") or "滑块验证未通过"
-            return False, f"滑块校验失败: {err_msg}"
-
         self.result_token = j["data"]["resultToken"]
         return self.send_sms_with_token(self.result_token)
 
@@ -177,8 +219,6 @@ class UnicomClient:
             _LOGGER.info("短信请求异常但resultToken有效，视为短信已下发: %s", e)
             return True, "短信验证码已成功下发"
 
-        return True, "短信验证码已成功下发"
-
     def login_with_sms(self, code: str) -> bool:
         """步骤4: 提交短信验证码登录并获取短效 token_online"""
         ts = time.strftime("%Y%m%d%H%M%S")
@@ -226,8 +266,12 @@ class UnicomClient:
             return True
         return False
 
-    def fetch_all_data(self) -> dict:
-        """拉取联通用户数据"""
+    def fetch_all_data(self, start_date: str = "", fetch_details: bool = True) -> dict:
+        """拉取联通用户数据
+
+        fetch_details=False 时跳过三类详单 (「自动获取通话记录」已关闭)，
+        只刷新话费/流量/个人信息，详单由协调器用本地缓存展示。
+        """
         if not self.token_online or not self.desmobile:
             _LOGGER.warning("联通手机号 %s 缺少凭据，需要重新认证", self.phone)
             raise CarrierAuthExpiredError("联通凭据缺失，需要重新认证")
@@ -238,6 +282,8 @@ class UnicomClient:
                                  "showType": "01"}, timeout=15)
         try:
             j = r.json()
+            if not isinstance(j, dict):
+                j = {}
         except Exception as e:
             _LOGGER.error("联通 queryUserInfoSeven 解析失败: %s", e)
             j = {}
@@ -312,6 +358,7 @@ class UnicomClient:
                             or str(item.get("isWarn", "")) == "1"
                         )
                         data_out["balance"] = -abs(val) if is_arrears else val
+                        data_out["balance_fetched"] = True
                         if is_arrears:
                             data_out["balance_title"] = title or "当前欠费"
                     except Exception:
@@ -349,6 +396,10 @@ class UnicomClient:
                 timeout=8,
             )
             j_bal = r_bal.json()
+            if j_bal.get("limitPeriodFlag") or j_bal.get("curntbalancecust") == "--":
+                data_out["is_limit_period"] = True
+                data_out["limit_period_prompt"] = j_bal.get("limitPeriodPrompt") or "每月1日0点至8点系统出账期"
+
             if j_bal.get("code") == "0000" or j_bal.get("curntbalancecust") or j_bal.get("overBalance"):
                 # 优先检查欠费字段 overBalance / realowefee / owefee
                 over_bal = j_bal.get("overBalance") or j_bal.get("realowefee") or j_bal.get("owefee")
@@ -360,7 +411,8 @@ class UnicomClient:
                 if over_val > 0:
                     data_out["balance"] = -abs(over_val)
                     data_out["balance_title"] = "当前欠费"
-                elif j_bal.get("curntbalancecust") is not None:
+                    data_out["balance_fetched"] = True
+                elif j_bal.get("curntbalancecust") is not None and str(j_bal["curntbalancecust"]).strip() != "--":
                     try:
                         cust_bal = float(j_bal["curntbalancecust"])
                         # 若标题或上下文已确认为欠费，且余额为正数，则取负值
@@ -368,6 +420,7 @@ class UnicomClient:
                             data_out["balance"] = -abs(cust_bal)
                         else:
                             data_out["balance"] = cust_bal
+                        data_out["balance_fetched"] = True
                     except Exception:
                         pass
                 
@@ -428,21 +481,60 @@ class UnicomClient:
                 flow_remain_unit = j_ocs.get("canuseFlowAllUnit", "GB")
                 if flow_remain_val:
                     data_out["flow_remain"] = f"{flow_remain_val} {flow_remain_unit}".strip()
+                    try:
+                        data_out["flow_remain_gb"] = float(flow_remain_val)
+                    except Exception:
+                        pass
 
                 flow_used_mb = float(j_ocs.get("allUserFlow") or 0.0)
                 data_out["flow_used_mb"] = flow_used_mb
                 data_out["flow_used_gb"] = round(flow_used_mb / 1024, 2)
                 data_out["flow_exceed"] = j_ocs.get("flowExceed", 0.0)
 
+                # 自动计算流量总额
+                try:
+                    raw_rem = data_out.get("flow_remain_gb")
+                    rem_gb = float(raw_rem) if isinstance(raw_rem, (int, float, str)) else 0.0
+                    raw_used = data_out.get("flow_used_gb")
+                    used_gb = float(raw_used) if isinstance(raw_used, (int, float, str)) else 0.0
+                    if rem_gb > 0.0 or used_gb > 0.0:
+                        data_out["flow_total_gb"] = round(rem_gb + used_gb, 2)
+                except Exception:
+                    pass
+
                 # 语音核心与汇总
                 voice_remain_val = j_ocs.get("canUseValueAll")
                 voice_remain_unit = j_ocs.get("canuseVoiceAllUnit", "分钟")
                 if voice_remain_val is not None:
                     data_out["voice_remain"] = f"{voice_remain_val} {voice_remain_unit}".strip()
-                    data_out["voice_remain_num"] = voice_remain_val
-                data_out["voice_used"] = j_ocs.get("voiceHeadUsed", 0)
+                    try:
+                        data_out["voice_remain_num"] = int(float(voice_remain_val)) if isinstance(voice_remain_val, (int, float, str)) else 0
+                    except Exception:
+                        data_out["voice_remain_num"] = voice_remain_val
+                try:
+                    vh_used = j_ocs.get("voiceHeadUsed", 0)
+                    data_out["voice_used"] = int(float(vh_used)) if isinstance(vh_used, (int, float, str)) else 0
+                except Exception:
+                    data_out["voice_used"] = 0
                 data_out["voice_exceed"] = j_ocs.get("voiceExceed", 0)
-                data_out["voice_total"] = j_ocs.get("voiceSumresource", 0)
+                try:
+                    v_res = j_ocs.get("voiceSumresource", 0)
+                    v_tot = int(float(v_res)) if isinstance(v_res, (int, float, str)) else 0
+                except Exception:
+                    v_tot = 0
+                try:
+                    raw_vr = data_out.get("voice_remain_num")
+                    v_rem = int(float(raw_vr)) if isinstance(raw_vr, (int, float, str)) else 0
+                except Exception:
+                    v_rem = 0
+                try:
+                    raw_vu = data_out.get("voice_used")
+                    v_used = int(float(raw_vu)) if isinstance(raw_vu, (int, float, str)) else 0
+                except Exception:
+                    v_used = 0
+                if (v_tot <= v_used or v_tot < v_rem) and v_rem > 0:
+                    v_tot = v_rem + v_used
+                data_out["voice_total"] = v_tot
 
                 # 短信核心与汇总
                 sms_remain_val = j_ocs.get("canUseSmsAll", 0)
@@ -466,7 +558,7 @@ class UnicomClient:
                         pkg_total_mb = float(detail.get("total") or 0.0)
                         pkg_remain_mb = float(detail.get("remain") or 0.0)
                         pkg_end = detail.get("endDate", "长期有效")
-                        flow_packages.append(f"{pkg_name}: 剩余 {pkg_remain_mb/1024:.2f}GB / 总计 {pkg_total_mb/1024:.2f}GB ({pkg_end})")
+                        flow_packages.append(f"{pkg_name}: 剩余 {pkg_remain_mb/1024:.2f}GB / 共 {pkg_total_mb/1024:.2f}GB ({pkg_end})")
                         for vc in detail.get("viceCardlist", []):
                             num = vc.get("usernumber", "未知")
                             u_mb = float(vc.get("use") or 0.0)
@@ -478,7 +570,7 @@ class UnicomClient:
                         pkg_total = detail.get("total", 0)
                         pkg_remain = detail.get("remain", 0)
                         pkg_end = detail.get("endDate", "长期有效")
-                        voice_packages.append(f"{pkg_name}: 剩余 {pkg_remain}分钟 / 总计 {pkg_total}分钟 ({pkg_end})")
+                        voice_packages.append(f"{pkg_name}: 剩余 {pkg_remain}分钟 / 共 {pkg_total}分钟 ({pkg_end})")
                         for vc in detail.get("viceCardlist", []):
                             num = vc.get("usernumber", "未知")
                             u_min = int(vc.get("use") or 0)
@@ -536,10 +628,10 @@ class UnicomClient:
                 cust_name = user_info.get("custname")
                 if use_cust_name:
                     data_out["real_name"] = use_cust_name
-                    data_out["cust_name"] = cust_name or ""
+                    data_out["cust_name"] = cust_name or use_cust_name
                 elif cust_name:
                     data_out["real_name"] = cust_name
-                    data_out["cust_name"] = "个人用户"
+                    data_out["cust_name"] = cust_name
 
                 data_out["cert_type"] = user_info.get("usecustpspttype") or user_info.get("certtype") or "18位身份证"
                 data_out["cert_code"] = user_info.get("usecustpsptcode") or user_info.get("certnum") or ""
@@ -559,5 +651,502 @@ class UnicomClient:
         except Exception as e:
             _LOGGER.debug("拉取联通个人信息接口异常: %s", e)
 
+        if not fetch_details:
+            return data_out
+
+        # 7. 拉取通话流水清单、短信详单与上网流量详单 (三类详单共用同一次握手与RSA免密凭据)
+        detail_session = None
+        try:
+            detail_session = self._create_detail_session()
+        except Exception as err:
+            _LOGGER.debug("创建联通详单会话异常: %s", err)
+
+        # 解析查询月份 (按自然月查询，展示区间为该月 1 日 ~ 月末)
+        yyyy, mm, dd = resolve_query_month(start_date)
+        range_start, range_end = month_range(yyyy, mm)
+
+        try:
+            call_res = self.query_call_records(session=detail_session, yyyy=yyyy, mm=mm, dd=dd)
+            data_out.update(call_res)
+        except Exception as err:
+            _LOGGER.debug("拉取联通通话流水流程异常: %s", err)
+            data_out["call_records"] = []
+            data_out["call_count"] = 0
+            data_out["last_call"] = {}
+            data_out["call_start_date"] = range_start
+            data_out["call_end_date"] = range_end
+            data_out["call_need_auth"] = False
+            data_out["call_auth_status"] = "有效"
+            data_out["call_auth_remaining_minutes"] = 30
+
+        try:
+            sms_res = self.query_sms_records(session=detail_session, yyyy=yyyy, mm=mm, dd=dd)
+            data_out.update(sms_res)
+        except Exception as err:
+            _LOGGER.debug("拉取联通短信详单流程异常: %s", err)
+            data_out["sms_records"] = []
+            data_out["sms_count"] = 0
+            data_out["sms_daily"] = []
+            data_out["sms_total"] = {}
+            data_out["sms_last"] = {}
+            data_out["sms_start_date"] = range_start
+            data_out["sms_end_date"] = range_end
+            data_out["sms_status"] = "有效"
+
+        try:
+            net_res = self.query_net_records(session=detail_session, yyyy=yyyy, mm=mm, dd=dd)
+            data_out.update(net_res)
+        except Exception as err:
+            _LOGGER.debug("拉取联通上网流量详单流程异常: %s", err)
+            data_out["net_records"] = []
+            data_out["net_count"] = 0
+            data_out["net_daily"] = []
+            data_out["net_total"] = {}
+            data_out["net_last"] = {}
+            data_out["net_start_date"] = range_start
+            data_out["net_end_date"] = range_end
+            data_out["net_status"] = "有效"
+
         return data_out
+
+    def _create_detail_session(self) -> requests.Session:
+        """创建联通详单专用会话并完成握手与免密存入"""
+        try:
+            device_uuid = str(uuid.UUID(self.device_id)) if len(self.device_id) == 32 else str(uuid.uuid4())
+        except Exception:
+            device_uuid = str(uuid.uuid4())
+        close_type = "28934581-39C1-4185-94E2-87E30AD7EE1D"
+
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": APP_UA,
+            "Accept": "*/*",
+        })
+        for k, v in requests.utils.dict_from_cookiejar(self.app.cookies).items():
+            session.cookies.set(k, v, domain=".10010.com")
+
+        for domain in ("https://hlbasic.10010.com", "https://m.client.10010.com"):
+            try:
+                session.post(
+                    f"{domain}/servicequerybusiness/thDeatilFrom/hcBut",
+                    data={
+                        "channelCode": "", "closeType": close_type, "contactCode": "",
+                        "duanlianjieabc": "", "externalSources": "", "saleChannel": "",
+                        "sbNo": device_uuid, "serviceType": ""
+                    },
+                    timeout=5,
+                )
+            except Exception as err:
+                _LOGGER.debug("联通详单前置 hcBut 请求异常(已忽略): %s", err)
+
+            try:
+                session.post(
+                    f"{domain}/servicequerybusiness/detilVerify/saveVerify",
+                    data={
+                        "channelCode": "", "closeType": close_type, "contactCode": "",
+                        "duanlianjieabc": "", "externalSources": "", "saleChannel": "",
+                        "sbNo": device_uuid, "serviceType": ""
+                    },
+                    timeout=5,
+                )
+            except Exception as err:
+                _LOGGER.debug("联通详单前置 saveVerify 请求异常(已忽略): %s", err)
+
+        return session
+
+    def query_call_records(self, session: Optional[requests.Session] = None, yyyy: str = "", mm: str = "", dd: str = "") -> dict:
+        """拉取联通通话流水清单 (语音详单)"""
+        now = time.localtime()
+        if not yyyy:
+            yyyy = time.strftime("%Y", now)
+        if not mm:
+            mm = time.strftime("%m", now)
+        if not dd:
+            dd = time.strftime("%d", now)
+
+        range_start, range_end = month_range(yyyy, mm)
+        result = {
+            "call_records": [],
+            "call_count": 0,
+            "last_call": {},
+            "call_start_date": range_start,
+            "call_end_date": range_end,
+            "call_need_auth": False,
+            "call_auth_status": "有效",
+            "call_auth_remaining_minutes": 30,
+        }
+
+        try:
+            sms_val = rsa_encrypt_xiangdan("0")
+            if session is None:
+                session = self._create_detail_session()
+
+            params = {
+                "orderFlag": "01",
+                "reqPageNum": "1",
+                "duanlianjieabc": "",
+                "serviceType": "",
+                "flogClose": "0",
+                "yyyy": yyyy,
+                "mm": mm,
+                "contactCode": "",
+                "saleChannel": "",
+                "channelCode": "",
+                "endTime": "",
+                "dd": dd,
+                "externalSources": "",
+                "queryMonthAndDay": "month",
+                "language": "chinese",
+                "perRecordNum": "150",
+                "sms": sms_val,
+                "startTime": "",
+                "newVersion": "0"
+            }
+
+            resp = session.get(
+                "https://hlbasic.10010.com/serviceimportantbusiness/query/getPhoneByDetailContent.htm",
+                params=params,
+                timeout=12,
+            )
+
+            if resp.status_code == 200 and resp.text and resp.text != "999999":
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+
+                if data.get("code") == "0000" and isinstance(data.get("data"), dict):
+                    detail_info = data["data"].get("detailInfo") or []
+                    call_records = []
+                    for item in detail_info:
+                        if not isinstance(item, dict):
+                            continue
+                        call_date = str(item.get("callDateFormat") or "").strip()
+                        call_time = str(item.get("callTimeFormat") or "").strip()
+                        full_time = f"{call_date} {call_time}".strip() if (call_date and call_time) else str(item.get("calltime") or "")
+
+                        # 规范化呼叫方向 (1: 主叫, 2: 被叫)
+                        raw_type = str(item.get("calltype") or "")
+                        type_name = str(item.get("callTypeName") or "")
+                        if "被叫" in type_name or raw_type == "2":
+                            mapped_type = "被叫"
+                        elif "主叫" in type_name or raw_type in ("1", "3"):
+                            mapped_type = "主叫"
+                        else:
+                            mapped_type = type_name or "通话"
+
+                        fee_val = item.get("totalfee") or item.get("voicefee") or "0.00"
+                        fee_str = f"{fee_val}元" if not str(fee_val).endswith("元") else str(fee_val)
+
+                        call_records.append({
+                            "call_time": full_time,
+                            "type": mapped_type,
+                            "call_type": item.get("voicetype") or "普通通话",
+                            "phone_number": str(item.get("othernumber") or "").strip(),
+                            "duration": str(item.get("calllonghour") or "").strip(),
+                            "location": str(item.get("eparchyname") or "").strip(),
+                            "location_coordinate": "",
+                            "number_location": str(item.get("calledhome") or "").strip(),
+                            "number_isp": "",
+                            "number_location_coordinate": "",
+                            "fee": fee_str,
+                        })
+
+                    # 本地归属地库补充/纠正
+                    enrich_call_records(call_records)
+
+                    result["call_records"] = call_records
+                    result["call_count"] = len(call_records)
+                    result["last_call"] = call_records[0] if call_records else {}
+                    _LOGGER.debug("联通通话流水拉取成功: 共 %d 条", len(call_records))
+            elif resp.text == "999999":
+                _LOGGER.debug("联通通话流水接口返回 999999 (会话未建立或需重新登录)，启用本地缓存兜底")
+        except Exception as err:
+            _LOGGER.debug("拉取联通通话流水异常(降级使用本地缓存兜底): %s", err)
+
+        return result
+
+    def query_sms_records(self, session: Optional[requests.Session] = None, yyyy: str = "", mm: str = "", dd: str = "") -> dict:
+        """拉取联通短信详单 (短彩信流水)"""
+        now = time.localtime()
+        if not yyyy:
+            yyyy = time.strftime("%Y", now)
+        if not mm:
+            mm = time.strftime("%m", now)
+        if not dd:
+            dd = time.strftime("%d", now)
+
+        range_start, range_end = month_range(yyyy, mm)
+        result = {
+            "sms_records": [],
+            "sms_count": 0,
+            "sms_daily": [],
+            "sms_total": {},
+            "sms_last": {},
+            "sms_start_date": range_start,
+            "sms_end_date": range_end,
+            "sms_status": "有效",
+        }
+
+        try:
+            sms_val = rsa_encrypt_xiangdan("0")
+            if session is None:
+                session = self._create_detail_session()
+
+            sms_params = {
+                "year": yyyy,
+                "month": mm,
+                "day": dd,
+                "queryMonthAndDay": "month",
+                "sureFlag": "0",
+                "sms": sms_val,
+                "duanlianjieabc": "", "channelCode": "", "serviceType": "",
+                "saleChannel": "", "externalSources": "", "contactCode": ""
+            }
+
+            resp = session.get(
+                "https://m.client.10010.com/serviceimportantbusiness/query/querySmsByDetailContent",
+                params=sms_params,
+                timeout=12,
+            )
+
+            if resp.status_code == 200 and resp.text and resp.text != "999999":
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+
+                if data.get("code") == "0000" and isinstance(data.get("data"), dict):
+                    inner_data = data["data"]
+                    record_map = inner_data.get("recordMap") or {}
+                    records: List[Dict[str, Any]] = []
+
+                    # 业务类型映射字典
+                    sms_types = {
+                        "01": "国内短信", "02": "国际短信", "03": "国内彩信",
+                        "04": "国际漫游短信", "05": "集团短信", "06": "国际彩信",
+                        "07": "volte国际短信", "08": "5G消息", "09": "国内短信(5G消息转短)",
+                        "10": "卫星短信", "11": "卫星短信(北斗)"
+                    }
+
+                    for date_key in sorted(record_map.keys(), reverse=True):
+                        items = record_map[date_key] or []
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            dt_str = str(item.get("dateTime") or "").strip()
+                            d_str = dt_str[:10] if len(dt_str) >= 10 else f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+                            t_str = dt_str[11:] if len(dt_str) > 10 else ""
+                            stype = str(item.get("smstype") or "")
+                            direction = "接收" if stype == "1" else "发送"
+                            btype = str(item.get("businesstype") or "")
+                            fee_val = float(item.get("amount") or item.get("fee") or 0.0)
+
+                            records.append({
+                                "datetime": dt_str,
+                                "date": d_str,
+                                "time": t_str,
+                                "phone_number": str(item.get("othernum") or "").strip(),
+                                "type": direction,
+                                "count": 1,
+                                "fee": f"{fee_val:.2f}",
+                                "fee_yuan": fee_val,
+                                "business_type": sms_types.get(btype, btype or "短信"),
+                                "number_location": "",
+                                "number_isp": "",
+                                "number_location_coordinate": "",
+                            })
+
+                    # 本地归属地及坐标丰富
+                    if records:
+                        try:
+                            from ..phone_region import enrich_number_fields
+                            enrich_number_fields(records)
+                        except Exception as err:
+                            _LOGGER.debug("丰富短信归属地异常: %s", err)
+
+                    # 按天汇总 (date, count, type, fee)
+                    daily_dict: Dict[tuple, Dict[str, Any]] = {}
+                    for r in records:
+                        d_key = (r["date"], r["type"])
+                        if d_key not in daily_dict:
+                            daily_dict[d_key] = {
+                                "date": r["date"],
+                                "count": 0,
+                                "type": r["type"],
+                                "fee": 0.0,
+                            }
+                        daily_dict[d_key]["count"] += 1
+                        daily_dict[d_key]["fee"] = round(daily_dict[d_key]["fee"] + r["fee_yuan"], 2)
+
+                    sms_daily = list(daily_dict.values())
+
+                    # 合计节点
+                    total_fee = float(inner_data.get("totalfee") or sum(r["fee_yuan"] for r in records))
+                    total_cnt = int(inner_data.get("replaceShareMap", {}).get("allSmsNum") or len(records))
+                    sent_cnt = sum(1 for r in records if r["type"] == "发送")
+                    recv_cnt = sum(1 for r in records if r["type"] == "接收")
+
+                    sms_total = {
+                        "count": total_cnt,
+                        "sent": sent_cnt,
+                        "received": recv_cnt,
+                        "fee": round(total_fee, 2),
+                        "fee_yuan": round(total_fee, 2),
+                    }
+
+                    result["sms_records"] = records
+                    result["sms_count"] = len(records)
+                    result["sms_daily"] = sms_daily
+                    result["sms_total"] = sms_total
+                    result["sms_last"] = records[0] if records else {}
+                    _LOGGER.debug("联通短信详单拉取成功: 共 %d 条", len(records))
+        except Exception as err:
+            _LOGGER.debug("拉取联通短信详单异常: %s", err)
+
+        return result
+
+    def query_net_records(self, session: Optional[requests.Session] = None, yyyy: str = "", mm: str = "", dd: str = "") -> dict:
+        """拉取联通上网流量详单 (会话清单与按天汇总)"""
+        now = time.localtime()
+        if not yyyy:
+            yyyy = time.strftime("%Y", now)
+        if not mm:
+            mm = time.strftime("%m", now)
+        if not dd:
+            dd = time.strftime("%d", now)
+
+        range_start, range_end = month_range(yyyy, mm)
+        result = {
+            "net_records": [],
+            "net_count": 0,
+            "net_daily": [],
+            "net_total": {},
+            "net_last": {},
+            "net_start_date": range_start,
+            "net_end_date": range_end,
+            "net_status": "有效",
+        }
+
+        try:
+            sms_val = rsa_encrypt_xiangdan("0")
+            if session is None:
+                session = self._create_detail_session()
+
+            net_params = {
+                "menuId": "000200030004",
+                "YYYY": yyyy,
+                "MM": mm,
+                "DD": dd,
+                "queryMonthAndDay": "month",
+                "currNum": "1",
+                "fistrow": "100",  # 拉取当月最新的 100 条上网会话明细
+                "sms": sms_val,
+                "duanlianjieabc": "", "channelCode": "", "serviceType": "",
+                "saleChannel": "", "externalSources": "", "contactCode": ""
+            }
+
+            resp = session.get(
+                "https://m.client.10010.com/serviceimportantbusiness/queryNetWork/queryNetWorkDetailContent",
+                params=net_params,
+                timeout=12,
+            )
+
+            if resp.status_code == 200 and resp.text and resp.text != "999999":
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+
+                if data.get("code") == "0000":
+                    network_list = data.get("netWorkList") or []
+                    records: List[Dict[str, Any]] = []
+
+                    for item in network_list:
+                        if not isinstance(item, dict):
+                            continue
+                        bdate = str(item.get("begindate") or "")
+                        btime = str(item.get("begintime") or "")
+                        d_str = f"{bdate[:4]}-{bdate[4:6]}-{bdate[6:8]}" if len(bdate) == 8 else bdate
+                        t_str = f"{btime[:2]}:{btime[2:4]}:{btime[4:6]}" if len(btime) == 6 else btime
+                        dt_str = f"{d_str} {t_str}".strip()
+
+                        # 换算流量 MB
+                        pertotalsm = str(item.get("pertotalsm") or "0")
+                        pertotalsm_unit = str(item.get("pertotalsmUnit") or "")
+                        try:
+                            val_f = float(pertotalsm)
+                            if "KB" in pertotalsm_unit.upper():
+                                volume_mb = round(val_f / 1024, 4)
+                            elif "GB" in pertotalsm_unit.upper():
+                                volume_mb = round(val_f * 1024, 4)
+                            else:
+                                volume_mb = round(val_f, 4)
+                        except Exception:
+                            volume_mb = 0.0
+
+                        duration_sec = int(item.get("longhour") or 0)
+                        duration_desc = str(item.get("longhourtransform") or f"{duration_sec}秒")
+                        fee_yuan = float(item.get("totalfee") or item.get("fee") or 0.0)
+                        svc_name = str(item.get("svcname") or "通用流量")
+
+                        records.append({
+                            "date": d_str,
+                            "time": t_str,
+                            "datetime": dt_str,
+                            "volume": pertotalsm_unit or f"{volume_mb:.2f}MB",
+                            "volume_mb": volume_mb,
+                            "duration": duration_desc,
+                            "duration_seconds": duration_sec,
+                            "fee": f"{fee_yuan:.2f}",
+                            "fee_yuan": fee_yuan,
+                            "business_type": svc_name,
+                        })
+
+                    # 按天汇总 (date, volume_mb, duration_seconds, fee, sessions)
+                    daily_dict: Dict[str, Dict[str, Any]] = {}
+                    for r in records:
+                        d_str = r["date"]
+                        if d_str not in daily_dict:
+                            daily_dict[d_str] = {
+                                "date": d_str,
+                                "volume_mb": 0.0,
+                                "duration_seconds": 0,
+                                "fee": 0.0,
+                                "fee_yuan": 0.0,
+                                "sessions": 0,
+                            }
+                        daily_dict[d_str]["volume_mb"] = round(daily_dict[d_str]["volume_mb"] + r["volume_mb"], 4)
+                        daily_dict[d_str]["duration_seconds"] += r["duration_seconds"]
+                        daily_dict[d_str]["fee_yuan"] = round(daily_dict[d_str]["fee_yuan"] + r["fee_yuan"], 2)
+                        daily_dict[d_str]["fee"] = daily_dict[d_str]["fee_yuan"]
+                        daily_dict[d_str]["sessions"] += 1
+
+                    net_daily = list(daily_dict.values())
+
+                    # 合计节点
+                    total_vol_mb = float(data.get("totalsm") or sum(r["volume_mb"] for r in records))
+                    total_dur_sec = sum(r["duration_seconds"] for r in records)
+                    total_fee_yuan = float(data.get("totalfee") or sum(r["fee_yuan"] for r in records))
+                    total_sessions = int(data.get("totalRecord") or len(records))
+
+                    net_total = {
+                        "volume_mb": round(total_vol_mb, 2),
+                        "duration_seconds": total_dur_sec,
+                        "fee": round(total_fee_yuan, 2),
+                        "fee_yuan": round(total_fee_yuan, 2),
+                        "sessions": total_sessions,
+                        "count": total_sessions,
+                    }
+
+                    result["net_records"] = records
+                    result["net_count"] = len(records)
+                    result["net_daily"] = net_daily
+                    result["net_total"] = net_total
+                    result["net_last"] = records[0] if records else {}
+                    _LOGGER.debug("联通上网流量详单拉取成功: 共 %d 条", len(records))
+        except Exception as err:
+            _LOGGER.debug("拉取联通上网流量详单异常: %s", err)
+
+        return result
 

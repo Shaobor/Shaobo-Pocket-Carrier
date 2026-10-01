@@ -590,10 +590,11 @@ def enrich_number_fields(
     if index is None:
         index = get_index()
     try:
-        from .city_geo import coordinate_text
+        from .city_geo import coordinate_text, matched_key
     except Exception as err:  # 坐标表不可用只是少一列信息, 不影响记录本体
         _LOGGER.debug("坐标表不可用(已跳过坐标补充): %s", err)
         coordinate_text = None  # type: ignore[assignment]
+        matched_key = None  # type: ignore[assignment]
 
     for record in records or []:
         if not isinstance(record, dict):
@@ -603,12 +604,22 @@ def enrich_number_fields(
             if info:
                 record["number_location"] = info.get("location", "")
                 record["number_isp"] = info.get("isp", "")
-        if coordinate_text is None:
-            continue
+        # 地名规范化: 统一消除省份前缀 (如 "黑龙江哈尔滨" -> "哈尔滨")，避免卡片地点统计与迁徙图分裂成两条
         if "location" in record:
-            record["location_coordinate"] = coordinate_text(record.get("location"))
+            loc = record.get("location")
+            std_loc = matched_key(loc) if matched_key else None
+            if std_loc:
+                record["location"] = std_loc
+            if coordinate_text is not None:
+                record["location_coordinate"] = coordinate_text(record.get("location"))
+
         if "number_location" in record:
-            record["number_location_coordinate"] = coordinate_text(record.get("number_location"))
+            nloc = record.get("number_location")
+            std_nloc = matched_key(nloc) if matched_key else None
+            if std_nloc:
+                record["number_location"] = std_nloc
+            if coordinate_text is not None:
+                record["number_location_coordinate"] = coordinate_text(record.get("number_location"))
 
 
 def enrich_records(index: Optional[RegionIndex], records: List[Dict[str, Any]]) -> None:

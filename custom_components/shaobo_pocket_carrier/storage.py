@@ -37,13 +37,31 @@ async def async_save_carrier_account(hass: HomeAssistant, carrier: str, phone: s
     data = await store.async_load() or {}
     
     # 每个号码一条记录
+    existing = data.get(phone) or {}
     data[phone] = {
         "carrier": carrier,
         "phone": phone,
         "auth_data": auth_data,
+        "metrics": existing.get("metrics") or {},
     }
     await store.async_save(data)
     _LOGGER.info("已将手机号 %s 的最新凭据同步写入 .storage/%s", phone, storage_key)
+
+async def async_save_carrier_metrics(hass: HomeAssistant, carrier: str, phone: str, metrics: dict) -> None:
+    """持久化保存手机号有效核心指标 (如有效话费余额、剩余流量、语音等)，供系统出账期或异常时防抖兜底"""
+    storage_key = _get_storage_key(carrier)
+    store = Store(hass, STORAGE_VERSION, storage_key)
+    data = await store.async_load() or {}
+    if phone in data:
+        data[phone]["metrics"] = metrics
+        await store.async_save(data)
+
+async def async_load_carrier_metrics(hass: HomeAssistant, carrier: str, phone: str) -> dict:
+    """读取手机号最近一次有效的核心指标"""
+    storage_key = _get_storage_key(carrier)
+    store = Store(hass, STORAGE_VERSION, storage_key)
+    data = await store.async_load() or {}
+    return (data.get(phone) or {}).get("metrics") or {}
 
 async def async_remove_carrier_account(hass: HomeAssistant, carrier: str, phone: str) -> None:
     """从专属存储文件移除指定手机号"""

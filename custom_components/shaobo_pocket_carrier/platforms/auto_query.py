@@ -16,6 +16,10 @@
 
 掉线时: 若「自动登录」开关开启则先登录，登录成功后由触发源 2 自动续做查询；
 未开启则跳过并在实体属性里说明。
+
+联通: 详单无需二次认证，开关直接决定协调器每轮轮询是否拉取详单 (首次创建默认开启)；
+关闭后只刷新话费与流量，详单展示同月的本地缓存，可按「刷新详单流水」按钮手动拉取；
+切换查询月份 (改日期 / 每日重置 / 跨月) 时仍会拉取一次该月详单，保证日期与详单一致。
 """
 import datetime
 import logging
@@ -30,6 +34,8 @@ from homeassistant.helpers.restore_state import RestoreEntity
 
 from ..const import (
     AFTER_LOGIN_QUERY_DELAY,
+    CARRIER_UNICOM,
+    CONF_CARRIER,
     CONF_CALL_START_DATE,
     DAILY_RESET_START_DATE_TIME,
     DEFAULT_AUTO_QUERY_TIME,
@@ -60,7 +66,7 @@ _DAILY_TIMERS: Dict[str, Any] = {}
 # ---------------------------------------------------------------- 工具函数
 def parse_auto_query_time(value: Optional[str]) -> Tuple[int, int]:
     """解析 HH:MM[:SS] 为 (hour, minute)，非法值回退默认时间"""
-    raw = str(value or "").strip() or DEFAULT_AUTO_QUERY_TIME
+    raw = (value or "").strip() or DEFAULT_AUTO_QUERY_TIME
     try:
         parsed = datetime.time.fromisoformat(raw)
         return parsed.hour, parsed.minute
@@ -250,6 +256,12 @@ async def async_run_auto_query(
     runtime.busy = True
     try:
         _reset_query_start_date(hass, entry)
+        carrier = entry.data.get(CONF_CARRIER)
+        if carrier == CARRIER_UNICOM:
+            await coordinator.async_request_refresh()
+            runtime.auto_query_last_result = f"[{_trigger_label(trigger)}] 联通详单与数据已自动刷新"
+            return
+
         login_state = await async_detect_login_state(coordinator)
 
         if login_state == STATE_ERROR:
@@ -286,9 +298,24 @@ class _AutoQueryEntity(CarrierControlEntity):
     """自动获取通话记录实体基类 (switch / time 共用属性)"""
 
     @property
+    def _is_unicom(self) -> bool:
+        return self.entry.data.get(CONF_CARRIER) == CARRIER_UNICOM
+
+    @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         runtime = self._runtime
         hour, minute = parse_auto_query_time(runtime.auto_query_time)
+        if self._is_unicom:
+            return {
+                "功能说明": (
+                    "开启后每轮轮询都会拉取通话/短信/上网详单，并在每天设定时间把「通话详单查询起始日期」"
+                    "设为当月 1 日再刷新一次；关闭后轮询只刷新话费与流量，详单展示本地缓存，"
+                    "可按「刷新详单流水」手动获取 (切换查询月份时仍会拉取一次该月详单)"
+                ),
+                "每日执行时间": f"{hour:02d}:{minute:02d}",
+                "查询起始日期": "当月 1 日 (跟随当月，跨月自动滚动)",
+                "最近执行结果": runtime.auto_query_last_result,
+            }
         attrs: Dict[str, Any] = {
             "功能说明": (
                 "开启后每天到达设定时间会自动把「通话详单查询起始日期」设为当月 1 日并获取一次通话流水；"
@@ -327,17 +354,23 @@ class TelecomAutoQuerySwitch(_AutoQueryEntity, SwitchEntity, RestoreEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self._runtime.auto_query_enabled)
+        return self._runtime.auto_query_enabled
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last_state = await self.async_get_last_state()
         if last_state is not None and last_state.state in ("on", "off"):
             self._runtime.auto_query_enabled = last_state.state == "on"
+        elif self._is_unicom:
+            # 联通以前每轮轮询都拉详单: 首次创建开关时默认开启，保持升级前的行为
+            self._runtime.auto_query_enabled = True
         self._unsub_login = self.hass.bus.async_listen(
             EVENT_LOGIN_SUCCESS, self._handle_login_success
         )
         async_schedule_daily_query(self.hass, self.entry, self._runtime)
+        if self._is_unicom and self._runtime.auto_query_enabled:
+            # 启动时的首轮刷新早于开关恢复状态 (当时按关闭处理、没拉详单)，这里补拉一次
+            self._async_request_unicom_refresh()
 
     async def async_will_remove_from_hass(self) -> None:
         # 注意: 每日定时任务是"开关"与"时间"实体共用同一个 entry 键的，
@@ -366,6 +399,16 @@ class TelecomAutoQuerySwitch(_AutoQueryEntity, SwitchEntity, RestoreEntity):
         async_schedule_daily_query(self.hass, self.entry, self._runtime)
         self._runtime.notify()
         _LOGGER.info("自动获取通话记录已%s", "开启" if enabled else "关闭")
+        if enabled and self._is_unicom:
+            # 联通: 打开后立即拉一次详单，不必等下一轮轮询
+            self._async_request_unicom_refresh()
+
+    @callback
+    def _async_request_unicom_refresh(self) -> None:
+        self.hass.async_create_task(
+            self._coordinator.async_request_refresh(),
+            name=f"{DOMAIN}_unicom_detail_refresh",
+        )
 
     @callback
     def _handle_login_success(self, event) -> None:
@@ -490,7 +533,7 @@ class TelecomAutoLoginSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self._runtime.auto_login_enabled)
+        return self._runtime.auto_login_enabled
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
@@ -576,7 +619,7 @@ class TelecomDailyResetSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity)
 
     @property
     def is_on(self) -> bool:
-        return bool(self._runtime.daily_reset_enabled)
+        return self._runtime.daily_reset_enabled
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
