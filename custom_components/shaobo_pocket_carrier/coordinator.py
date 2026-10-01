@@ -374,10 +374,10 @@ class TelecomDataUpdateCoordinator(DataUpdateCoordinator):
 
         成功后持久化签名并立即拉取最新流水；三个参数缺一不可。
         """
-        code = str(sms_code or "").strip()
+        code = (sms_code or "").strip()
         options = self.entry.options if self.entry else {}
-        name = str(user_name or "").strip() or str(options.get(CONF_AUTH_USER_NAME, "") or "").strip()
-        id_no = str(id_card or "").strip() or str(options.get(CONF_AUTH_ID_CARD, "") or "").strip()
+        name = (user_name or "").strip() or str(options.get(CONF_AUTH_USER_NAME, "") or "").strip()
+        id_no = (id_card or "").strip() or str(options.get(CONF_AUTH_ID_CARD, "") or "").strip()
 
         missing = [
             label
@@ -474,8 +474,8 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
         self.client = UnicomClient(phone, auth_data)
         # 通话流水本地缓存 (.storage/Shaobo_CallRecords)，认证失效/未更新时兜底展示历史流水
         self.call_cache = CallRecordCache(hass, CARRIER_UNICOM, phone)
-        # 下一轮刷新强制拉取详单 (「刷新详单流水」按钮 / 修改查询起始日期等主动操作)，
-        # 不受「自动获取通话记录」开关限制，用后即清
+        # 下一轮刷新强制拉取详单 (每日定时自动获取 / 「刷新详单流水」按钮 / 修改查询起始日期)，
+        # 用后即清；普通轮询只刷新话费与流量，不拉详单
         self._force_detail_fetch = False
         # 当前展示的详单所属月份 (YYYY-MM)；None = 尚未从本地缓存读取
         self._detail_month: Optional[str] = None
@@ -494,13 +494,6 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
             name=f"China Unicom ({phone})",
             update_interval=timedelta(minutes=interval_min),
         )
-
-    @property
-    def auto_query_enabled(self) -> bool:
-        """「自动获取通话记录」开关是否开启 (开关实体恢复状态之前视为关闭)"""
-        store = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id) if self.entry else None
-        runtime = store.get("auth_runtime") if isinstance(store, dict) else None
-        return bool(getattr(runtime, "auto_query_enabled", False))
 
     def request_detail_fetch(self) -> None:
         """让下一轮刷新强制拉取三类详单 (不受「自动获取通话记录」开关限制)"""
@@ -522,8 +515,16 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
             raw_records = list(data.get("call_records") or [])
             sms_records = list(data.get("sms_records") or [])
             net_records = list(data.get("net_records") or [])
+            cached = await self.call_cache.async_load()
+            # 本轮拉到的三类详单全为空、而缓存不是查询月份的: 也要落盘记下"该月暂无记录"，
+            # 否则详单每天只拉一次，之后的轮询找不到同月缓存会一直显示"未获取"；
+            # 同月缓存则不能被全空结果覆盖 (同月记录只增不减，全空多半是接口异常)
+            empty_month = (
+                not data.get("detail_fetch_paused")
+                and str(cached.get("start_date") or "")[:7] != query_month
+            )
 
-            if raw_records or sms_records or net_records:
+            if raw_records or sms_records or net_records or empty_month:
                 # 按照通话时间倒序排序
                 if raw_records:
                     raw_records.sort(key=lambda r: str(r.get("call_time", "")), reverse=True)
@@ -538,7 +539,6 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
                     str(data.get("call_start_date", "")),
                     str(data.get("call_end_date", "")),
                 ]
-                cached = await self.call_cache.async_load()
                 if cached.get("signature") == signature:
                     return
 
@@ -574,7 +574,6 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
                 return
 
             # 无实时数据时用本地缓存兜底 (只用同月缓存，区间按查询月份重新计算，兼容旧格式缓存)
-            cached = await self.call_cache.async_load()
             saved_text = cached.get("saved_at_text", "")
             range_start, range_end = month_range(query_month[:4], query_month[5:7])
             # 本轮没拉详单时数据里没有区间，补上查询月份的区间 (否则传感器显示"当月月初")
@@ -646,13 +645,9 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
             self._detail_month = str(cached.get("start_date") or "")[:7]
 
         # 以下情况拉取详单，否则只刷新话费/流量，详单用同月的本地缓存展示:
-        # 「自动获取通话记录」开启 / 主动请求 (刷新详单流水、改日期) /
+        # 主动请求 (「自动获取通话记录」每日定时、刷新详单流水、改日期) /
         # 查询月份与当前展示的详单不是同一个月 (改日期、每日重置、跨月)，保证日期与详单对得上
-        fetch_details = (
-            self._force_detail_fetch
-            or self.auto_query_enabled
-            or query_month != self._detail_month
-        )
+        fetch_details = self._force_detail_fetch or query_month != self._detail_month
         self._force_detail_fetch = False
 
         try:

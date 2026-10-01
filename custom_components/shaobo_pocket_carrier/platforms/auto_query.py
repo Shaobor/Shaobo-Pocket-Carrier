@@ -17,8 +17,9 @@
 掉线时: 若「自动登录」开关开启则先登录，登录成功后由触发源 2 自动续做查询；
 未开启则跳过并在实体属性里说明。
 
-联通: 详单无需二次认证，开关直接决定协调器每轮轮询是否拉取详单 (首次创建默认开启)；
-关闭后只刷新话费与流量，详单展示同月的本地缓存，可按「刷新详单流水」按钮手动拉取；
+联通: 详单无需二次认证，开启后只在每天设定时间拉取一次三类详单 (首次创建默认开启)；
+定时任务不改查询起始日期 (只由「每日重置查询起始日期」开关管理)，按该日期所在月份拉取；
+轮询只刷新话费与流量，详单展示同月的本地缓存，可按「刷新详单流水」按钮随时手动拉取；
 切换查询月份 (改日期 / 每日重置 / 跨月) 时仍会拉取一次该月详单，保证日期与详单一致。
 """
 import datetime
@@ -223,6 +224,8 @@ async def async_run_auto_query(
 ) -> None:
     """自动获取一次通话记录 (供定时任务与登录成功回调调用)
 
+    联通: 不改查询起始日期，按「通话详单查询起始日期」所在月份强制拉取一次三类详单
+    电信:
     1. 查询起始日期重置为当月 1 日
     2. 登录态检查: 掉线 -> 交棒给统一的自动登录入口; 网络异常 -> 跳过
     3. 触发详单查询 (授权有效直接拉取; 失效则下发详单验证码并等待写入后自动提交)
@@ -255,13 +258,16 @@ async def async_run_auto_query(
 
     runtime.busy = True
     try:
-        _reset_query_start_date(hass, entry)
         carrier = entry.data.get(CONF_CARRIER)
         if carrier == CARRIER_UNICOM:
-            await coordinator.async_request_refresh()
-            runtime.auto_query_last_result = f"[{_trigger_label(trigger)}] 联通详单与数据已自动刷新"
+            # 联通普通轮询不拉详单，每天只在这里强制拉取一次；
+            # 不改查询起始日期 (由「每日重置查询起始日期」开关管理)，按当前日期所在月份拉取
+            ok = await coordinator.async_refresh_details()
+            msg = "已拉取最新详单流水" if ok else "拉取失败，请检查网络或登录状态"
+            runtime.auto_query_last_result = f"[{_trigger_label(trigger)}] {msg}"
             return
 
+        _reset_query_start_date(hass, entry)
         login_state = await async_detect_login_state(coordinator)
 
         if login_state == STATE_ERROR:
@@ -308,12 +314,12 @@ class _AutoQueryEntity(CarrierControlEntity):
         if self._is_unicom:
             return {
                 "功能说明": (
-                    "开启后每轮轮询都会拉取通话/短信/上网详单，并在每天设定时间把「通话详单查询起始日期」"
-                    "设为当月 1 日再刷新一次；关闭后轮询只刷新话费与流量，详单展示本地缓存，"
-                    "可按「刷新详单流水」手动获取 (切换查询月份时仍会拉取一次该月详单)"
+                    "开启后每天到达设定时间按「通话详单查询起始日期」所在月份拉取一次通话/短信/上网详单；"
+                    "轮询只刷新话费与流量，详单展示本地缓存，可按「刷新详单流水」随时手动获取 "
+                    "(切换查询月份时仍会拉取一次该月详单)"
                 ),
                 "每日执行时间": f"{hour:02d}:{minute:02d}",
-                "查询起始日期": "当月 1 日 (跟随当月，跨月自动滚动)",
+                "查询起始日期": "按「通话详单查询起始日期」(由「每日重置查询起始日期」开关管理)",
                 "最近执行结果": runtime.auto_query_last_result,
             }
         attrs: Dict[str, Any] = {
@@ -362,15 +368,12 @@ class TelecomAutoQuerySwitch(_AutoQueryEntity, SwitchEntity, RestoreEntity):
         if last_state is not None and last_state.state in ("on", "off"):
             self._runtime.auto_query_enabled = last_state.state == "on"
         elif self._is_unicom:
-            # 联通以前每轮轮询都拉详单: 首次创建开关时默认开启，保持升级前的行为
+            # 联通首次创建开关时默认开启 (每天定时拉取一次详单)
             self._runtime.auto_query_enabled = True
         self._unsub_login = self.hass.bus.async_listen(
             EVENT_LOGIN_SUCCESS, self._handle_login_success
         )
         async_schedule_daily_query(self.hass, self.entry, self._runtime)
-        if self._is_unicom and self._runtime.auto_query_enabled:
-            # 启动时的首轮刷新早于开关恢复状态 (当时按关闭处理、没拉详单)，这里补拉一次
-            self._async_request_unicom_refresh()
 
     async def async_will_remove_from_hass(self) -> None:
         # 注意: 每日定时任务是"开关"与"时间"实体共用同一个 entry 键的，
@@ -399,16 +402,6 @@ class TelecomAutoQuerySwitch(_AutoQueryEntity, SwitchEntity, RestoreEntity):
         async_schedule_daily_query(self.hass, self.entry, self._runtime)
         self._runtime.notify()
         _LOGGER.info("自动获取通话记录已%s", "开启" if enabled else "关闭")
-        if enabled and self._is_unicom:
-            # 联通: 打开后立即拉一次详单，不必等下一轮轮询
-            self._async_request_unicom_refresh()
-
-    @callback
-    def _async_request_unicom_refresh(self) -> None:
-        self.hass.async_create_task(
-            self._coordinator.async_request_refresh(),
-            name=f"{DOMAIN}_unicom_detail_refresh",
-        )
 
     @callback
     def _handle_login_success(self, event) -> None:

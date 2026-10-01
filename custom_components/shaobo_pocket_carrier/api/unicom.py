@@ -269,7 +269,7 @@ class UnicomClient:
     def fetch_all_data(self, start_date: str = "", fetch_details: bool = True) -> dict:
         """拉取联通用户数据
 
-        fetch_details=False 时跳过三类详单 (「自动获取通话记录」已关闭)，
+        fetch_details=False 时跳过三类详单 (普通轮询；详单每天定时或手动拉取)，
         只刷新话费/流量/个人信息，详单由协调器用本地缓存展示。
         """
         if not self.token_online or not self.desmobile:

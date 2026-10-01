@@ -18,9 +18,13 @@ from ..phone_region import (
     normalize_net_daily,
 )
 
-# 「自动获取通话记录」关闭时 (协调器标记 detail_fetch_paused) 详单类实体的展示文案
-_DETAIL_PAUSED_STATE = "未获取 (自动获取已关闭)"
-_DETAIL_PAUSED_NOTE = "「自动获取通话记录」已关闭，轮询不再拉取详单，可按「刷新详单流水」手动获取"
+# 本轮轮询没有拉取详单时 (协调器标记 detail_fetch_paused) 详单类实体的展示文案:
+# 联通轮询只刷新话费与流量，详单只在「自动获取通话记录」的每日设定时间拉取一次
+_DETAIL_PAUSED_STATE = "未获取"
+_DETAIL_PAUSED_NOTE = (
+    "轮询不拉取详单，展示本地缓存：开启「自动获取通话记录」后每天在设定时间拉取一次，"
+    "也可按「刷新详单流水」立即获取"
+)
 
 
 def _city_geo_text() -> str:
