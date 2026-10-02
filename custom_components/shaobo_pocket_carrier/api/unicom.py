@@ -47,6 +47,19 @@ def rsa_encrypt_xiangdan(text: str) -> str:
     c = PKCS1_v1_5.new(RSA.import_key(XIANGDAN_RSA_KEY))
     return base64.b64encode(c.encrypt(text.encode("utf-8"))).decode("utf-8")
 
+def _retry_once_on_network_error(send, name: str) -> requests.Response:
+    """读超时/连接失败时立即重试一次 (只用于保活与用户信息两个核心接口)
+
+    联通服务器偶发十几秒不响应 (Read timed out)。这两个接口没有降级路径，一失败整轮刷新
+    就失败、全部传感器变为不可用，所以先在这里扛一次瞬时抖动；其余接口各自容错降级，不重试。
+    保活重试沿用同一个 token_online，与超时后下一轮轮询的情形相同，不引入额外风险。
+    """
+    try:
+        return send()
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as err:
+        _LOGGER.info("联通 %s 接口无响应，立即重试一次: %s", name, err)
+        return send()
+
 def enrich_call_records(records) -> None:
     """用本地 phone2region 归属地库补充 number_location / number_isp / coordinate"""
     try:
@@ -253,12 +266,16 @@ class UnicomClient:
 
     def keep_alive(self) -> bool:
         """联通特有的 3~4 分钟滚动保活"""
-        data = {
-            **self._base_params(),
-            "token_online": self.token_online,
-            "encmobile": self.desmobile
-        }
-        r = self.app.post(f"{BASE_M}/mobileService/onLine.htm", data=data, timeout=15)
+        def send() -> requests.Response:
+            # 每次发送都重新生成 reqtime，重试不复用旧时间戳
+            data = {
+                **self._base_params(),
+                "token_online": self.token_online,
+                "encmobile": self.desmobile
+            }
+            return self.app.post(f"{BASE_M}/mobileService/onLine.htm", data=data, timeout=15)
+
+        r = _retry_once_on_network_error(send, "onLine.htm 保活")
         j = r.json()
         if j.get("code") == "0":
             self.token_online = j["token_online"]
@@ -277,9 +294,12 @@ class UnicomClient:
             raise CarrierAuthExpiredError("联通凭据缺失，需要重新认证")
 
         alive_ok = self.keep_alive()
-        r = self.app.get(f"{BASE_M}/mobileserviceimportant/home/queryUserInfoSeven",
-                         params={"desmobile": self.desmobile, "version": "iphone_c@13.1000",
-                                 "showType": "01"}, timeout=15)
+        r = _retry_once_on_network_error(
+            lambda: self.app.get(f"{BASE_M}/mobileserviceimportant/home/queryUserInfoSeven",
+                                 params={"desmobile": self.desmobile, "version": "iphone_c@13.1000",
+                                         "showType": "01"}, timeout=15),
+            "queryUserInfoSeven",
+        )
         try:
             j = r.json()
             if not isinstance(j, dict):

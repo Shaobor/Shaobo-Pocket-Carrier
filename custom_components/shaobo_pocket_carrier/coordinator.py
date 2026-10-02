@@ -29,6 +29,7 @@ from .const import (
     MIN_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_TELECOM,
     DEFAULT_SCAN_INTERVAL_UNICOM,
+    UNICOM_FAILURE_RETRY_SECONDS,
 )
 from .api.telecom import TelecomClient
 from .api.unicom import UnicomClient, month_range, resolve_query_month
@@ -647,8 +648,9 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
         # 以下情况拉取详单，否则只刷新话费/流量，详单用同月的本地缓存展示:
         # 主动请求 (「自动获取通话记录」每日定时、刷新详单流水、改日期) /
         # 查询月份与当前展示的详单不是同一个月 (改日期、每日重置、跨月)，保证日期与详单对得上
-        fetch_details = self._force_detail_fetch or query_month != self._detail_month
+        forced = self._force_detail_fetch
         self._force_detail_fetch = False
+        fetch_details = forced or query_month != self._detail_month
 
         try:
             data = await self.hass.async_add_executor_job(
@@ -702,5 +704,13 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("联通手机号 %s 登录凭证已失效，触发 Home Assistant 重新认证: %s", self.phone, auth_err)
             raise ConfigEntryAuthFailed(f"联通登录凭证失效: {auth_err}") from auth_err
         except Exception as err:
+            # 本轮失败: 主动请求的详单 (每日定时 / 刷新详单流水) 留到下一轮补拉，不能就此落空
+            if forced:
+                self._force_detail_fetch = True
             _LOGGER.error("拉取联通手机号 %s 数据/保活异常: %s", self.phone, err)
-            raise UpdateFailed(f"联通接口通信失败: {err}") from err
+            # 上一轮还成功 (首次失败，多为接口偶发超时) 时 1 分钟后补刷，尽快让实体恢复可用；
+            # 连续失败则回到正常轮询间隔，避免故障期间频繁请求联通接口
+            raise UpdateFailed(
+                f"联通接口通信失败: {err}",
+                retry_after=UNICOM_FAILURE_RETRY_SECONDS if self.last_update_success else None,
+            ) from err

@@ -187,6 +187,7 @@ ENTITY_ID_SUFFIXES = {
 # 轮询间隔
 UPDATE_INTERVAL_TELECOM = 1800  # 电信 30 分钟刷新一次
 UPDATE_INTERVAL_UNICOM = 600    # 联通 10 分钟平稳保活并刷新一次
+UNICOM_FAILURE_RETRY_SECONDS = 60  # 联通刷新首次失败 (如接口超时) 后 1 分钟补刷一次，不必干等一个轮询周期
 
 # 专属持久化存储文件名 (位于 <HA配置目录>/.storage/ 下)
 STORAGE_KEY_TELECOM = "Shaobo_Telecom"
