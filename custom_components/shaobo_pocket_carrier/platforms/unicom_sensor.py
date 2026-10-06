@@ -432,8 +432,22 @@ class UnicomSmsRemainSensor(BaseCarrierSensor):
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
+        pkg_total = self.data.get("sms_package_total")
+        if pkg_total is None or isinstance(pkg_total, (dict, list)):
+            raw_tot = self.data.get("sms_total")
+            if isinstance(raw_tot, (int, float, str)) and not isinstance(raw_tot, (dict, list)):
+                try:
+                    pkg_total = int(raw_tot)
+                except Exception:
+                    pkg_total = 0
+            else:
+                pkg_total = 0
+        try:
+            total_val = int(pkg_total)
+        except Exception:
+            total_val = 0
         return {
-            "套餐短信总额": f"{self.data.get('sms_total', 0)} 条",
+            "套餐短信总额": f"{total_val} 条",
             "本月已用短信": f"{self.data.get('sms_used', 0)} 条",
             "本月超出短信": f"{self.data.get('sms_exceed', 0)} 条",
             "数据截至": self.data.get("flush_time", ""),

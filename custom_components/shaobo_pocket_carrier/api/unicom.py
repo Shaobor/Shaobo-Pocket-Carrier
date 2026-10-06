@@ -557,13 +557,17 @@ class UnicomClient:
                 data_out["voice_total"] = v_tot
 
                 # 短信核心与汇总
-                sms_remain_val = j_ocs.get("canUseSmsAll", 0)
+                sms_remain_val = int(j_ocs.get("canUseSmsAll", 0) or 0)
                 sms_remain_unit = j_ocs.get("canuseSmsAllUnit", "条")
                 data_out["sms_remain"] = f"{sms_remain_val} {sms_remain_unit}".strip()
                 data_out["sms_remain_num"] = sms_remain_val
-                data_out["sms_used"] = j_ocs.get("smsHeadUsed", 0)
-                data_out["sms_exceed"] = j_ocs.get("smsExceed", 0)
-                data_out["sms_total"] = j_ocs.get("smsSumresource", 0)
+                sms_used_val = int(j_ocs.get("smsHeadUsed", 0) or 0)
+                data_out["sms_used"] = sms_used_val
+                data_out["sms_exceed"] = int(j_ocs.get("smsExceed", 0) or 0)
+                s_tot = int(j_ocs.get("smsSumresource", 0) or 0)
+                if (s_tot <= sms_used_val or s_tot < sms_remain_val) and sms_remain_val > 0:
+                    s_tot = sms_remain_val + sms_used_val
+                data_out["sms_package_total"] = s_tot
 
                 # 资源包明细拆解 (流量包、语音包各成员卡消耗分布)
                 resources = j_ocs.get("resources", [])
