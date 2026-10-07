@@ -576,29 +576,62 @@ class UnicomClient:
                 card_flow_usage = {}
                 card_voice_usage = {}
 
-                if len(resources) > 0 and isinstance(resources[0], dict):
-                    for detail in resources[0].get("details", []):
-                        pkg_name = detail.get("addUpItemName", "流量包")
-                        pkg_total_mb = float(detail.get("total") or 0.0)
-                        pkg_remain_mb = float(detail.get("remain") or 0.0)
-                        pkg_end = detail.get("endDate", "长期有效")
-                        flow_packages.append(f"{pkg_name}: 剩余 {pkg_remain_mb/1024:.2f}GB / 共 {pkg_total_mb/1024:.2f}GB ({pkg_end})")
-                        for vc in detail.get("viceCardlist", []):
-                            num = vc.get("usernumber", "未知")
-                            u_mb = float(vc.get("use") or 0.0)
-                            card_flow_usage[num] = card_flow_usage.get(num, 0.0) + u_mb
+                # 智能识别流量资源与语音资源
+                for idx, res in enumerate(resources):
+                    if not isinstance(res, dict):
+                        continue
+                    details = res.get("details", [])
+                    # 判断当前资源组是流量还是语音 (默认第0项为流量，第1项为语音)
+                    is_voice_group = idx == 1 or any(
+                        "分钟" in str(d.get("unit", "")) or "语音" in str(d.get("addUpItemName", "")) or "通话" in str(d.get("addUpItemName", ""))
+                        for d in details
+                    )
+                    if is_voice_group:
+                        for detail in details:
+                            pkg_name = detail.get("addUpItemName", "语音包")
+                            pkg_total = detail.get("total", 0)
+                            pkg_remain = detail.get("remain", 0)
+                            pkg_end = detail.get("endDate", "长期有效")
+                            voice_packages.append(f"{pkg_name}: 剩余 {pkg_remain}分钟 / 共 {pkg_total}分钟 ({pkg_end})")
+                            for vc in detail.get("viceCardlist", []):
+                                num = vc.get("usernumber", "未知")
+                                u_min = int(vc.get("use") or 0)
+                                card_voice_usage[num] = card_voice_usage.get(num, 0) + u_min
+                    else:
+                        for detail in details:
+                            pkg_name = detail.get("addUpItemName", "流量包")
+                            pkg_total_mb = float(detail.get("total") or 0.0)
+                            pkg_remain_mb = float(detail.get("remain") or 0.0)
+                            pkg_end = detail.get("endDate", "长期有效")
+                            flow_packages.append(f"{pkg_name}: 剩余 {pkg_remain_mb/1024:.2f}GB / 共 {pkg_total_mb/1024:.2f}GB ({pkg_end})")
+                            for vc in detail.get("viceCardlist", []):
+                                num = vc.get("usernumber", "未知")
+                                u_mb = float(vc.get("use") or 0.0)
+                                card_flow_usage[num] = card_flow_usage.get(num, 0.0) + u_mb
 
-                if len(resources) > 1 and isinstance(resources[1], dict):
-                    for detail in resources[1].get("details", []):
-                        pkg_name = detail.get("addUpItemName", "语音包")
-                        pkg_total = detail.get("total", 0)
-                        pkg_remain = detail.get("remain", 0)
-                        pkg_end = detail.get("endDate", "长期有效")
-                        voice_packages.append(f"{pkg_name}: 剩余 {pkg_remain}分钟 / 共 {pkg_total}分钟 ({pkg_end})")
-                        for vc in detail.get("viceCardlist", []):
-                            num = vc.get("usernumber", "未知")
-                            u_min = int(vc.get("use") or 0)
-                            card_voice_usage[num] = card_voice_usage.get(num, 0) + u_min
+                # 补全主卡(本机)已用量归属 (若接口已返回带星号脱敏本机则复用，绝不重复生成第二个本机)
+                masked_self = f"{self.phone[:3]}****{self.phone[-4:]}" if len(self.phone) == 11 else self.phone
+                self_tail = self.phone[-4:] if len(self.phone) >= 4 else self.phone
+
+                tot_voice_used = data_out.get("voice_used") or 0
+                existing_v_self_key = next((k for k in card_voice_usage if self.phone in k or k.endswith(self_tail)), None)
+                if existing_v_self_key:
+                    sub_v_sum = sum(v for k, v in card_voice_usage.items() if k != existing_v_self_key)
+                    if card_voice_usage[existing_v_self_key] == 0:
+                        card_voice_usage[existing_v_self_key] = max(0, tot_voice_used - sub_v_sum)
+                else:
+                    sub_v_sum = sum(card_voice_usage.values())
+                    card_voice_usage[masked_self] = max(0, tot_voice_used - sub_v_sum)
+
+                tot_flow_mb = data_out.get("flow_used_mb") or 0.0
+                existing_f_self_key = next((k for k in card_flow_usage if self.phone in k or k.endswith(self_tail)), None)
+                if existing_f_self_key:
+                    sub_f_sum = sum(v for k, v in card_flow_usage.items() if k != existing_f_self_key)
+                    if card_flow_usage[existing_f_self_key] == 0.0:
+                        card_flow_usage[existing_f_self_key] = max(0.0, tot_flow_mb - sub_f_sum)
+                else:
+                    sub_f_sum = sum(card_flow_usage.values())
+                    card_flow_usage[masked_self] = max(0.0, tot_flow_mb - sub_f_sum)
 
                 data_out["flow_packages"] = flow_packages
                 data_out["voice_packages"] = voice_packages

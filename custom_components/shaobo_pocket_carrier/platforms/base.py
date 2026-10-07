@@ -39,10 +39,11 @@ class ForcedEntityIdMixin:
     """
 
     _forced_entity_id: str = ""
+    entity_id: str
 
     def _setup_forced_entity_id(self, platform_domain: str, phone: str, key: str) -> None:
         """设置固定实体 ID (形如 <domain>.<手机号>_<英文后缀>)"""
-        suffix = str(ENTITY_ID_SUFFIXES.get(key) or key or "").strip()
+        suffix = (ENTITY_ID_SUFFIXES.get(key) or key or "").strip()
         if not suffix:
             return
         self._forced_entity_id = f"{platform_domain}.{phone}_{suffix}"
@@ -52,11 +53,12 @@ class ForcedEntityIdMixin:
     def _async_migrate_entity_id(self) -> None:
         """把已注册实体迁移到固定实体 ID (注册表 ID 优先于代码中设置的 ID)"""
         target = getattr(self, "_forced_entity_id", "")
-        current = self.entity_id
-        if not target or not current or current == target or self.hass is None:
+        current = getattr(self, "entity_id", "")
+        hass_inst = getattr(self, "hass", None)
+        if not target or not current or current == target or hass_inst is None:
             return
         try:
-            registry = er.async_get(self.hass)
+            registry = er.async_get(hass_inst)
             if registry.async_get(target) is not None:
                 _LOGGER.warning(
                     "%s 的目标实体 ID %s 已被其它实体占用，保留当前 %s",
@@ -88,6 +90,7 @@ class CarrierControlEntity(ForcedEntityIdMixin, Entity):
     - 安全写状态: 后台任务/事件驱动时避免对已移除实体写状态
     """
 
+    hass: HomeAssistant
     _attr_has_entity_name = False
     _attr_should_poll = False
 
@@ -104,6 +107,7 @@ class CarrierControlEntity(ForcedEntityIdMixin, Entity):
         carrier: Optional[str] = None,
     ) -> None:
         super().__init__()
+        self.hass = hass
         self._coordinator = coordinator
         self.phone = phone
         self.entry = entry

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """中国运营商 Home Assistant 配置流 (支持多手机号、方案一滑块交互与模块化隔离)"""
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Optional
 import logging
 import random
 import time
@@ -34,7 +34,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL_TELECOM,
     DEFAULT_SCAN_INTERVAL_UNICOM,
 )
-from .api.telecom import TelecomClient, TELECOM_DEVICE_MODELS
+from .api.telecom import TelecomClient, TELECOM_DEVICE_MODELS, DEFAULT_TELECOM_MODEL
 from .api.unicom import UnicomClient
 from .views import SLIDER_SESSIONS, CarrierSliderPageView, CarrierSliderVerifyView
 from .storage import async_save_carrier_account
@@ -49,8 +49,8 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self):
         self.carrier: str = CARRIER_TELECOM
         self.phone: str = ""
-        self.telecom_client: TelecomClient = None
-        self.unicom_client: UnicomClient = None
+        self.telecom_client: Optional[TelecomClient] = None
+        self.unicom_client: Optional[UnicomClient] = None
 
     async def async_step_user(self, user_input=None):
         """步骤1: 选择运营商与输入手机号"""
@@ -130,6 +130,13 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             sms_code = user_input.get("sms_code", "").strip()
+            if not self.telecom_client:
+                errors["base"] = "unknown"
+                return self.async_show_form(
+                    step_id="telecom_sms",
+                    data_schema=vol.Schema({vol.Required("sms_code"): str}),
+                    errors=errors,
+                )
             ok = await self.hass.async_add_executor_job(self.telecom_client.login_with_sms, sms_code)
             if ok:
                 auth_data = self.telecom_client.export_auth()
@@ -174,6 +181,14 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             sms_code = user_input.get("sms_code", "").strip()
+            if not self.unicom_client:
+                errors["base"] = "unknown"
+                return self.async_show_form(
+                    step_id="unicom_slider",
+                    data_schema=vol.Schema({vol.Required("sms_code"): str}),
+                    description_placeholders={"flow_id": self.flow_id},
+                    errors=errors,
+                )
             ok = await self.hass.async_add_executor_job(self.unicom_client.login_with_sms, sms_code)
             if ok:
                 SLIDER_SESSIONS.pop(self.flow_id, None)
@@ -260,8 +275,11 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 existing_model = None
                 if hasattr(self, "_reauth_entry") and self._reauth_entry:
                     existing_auth = self._reauth_entry.data.get(CONF_AUTH_DATA) or {}
-                    existing_model = existing_auth.get("device_model")
-                self.telecom_client = TelecomClient(self.phone, auth_data=existing_auth, device_model=existing_model)
+                self.telecom_client = TelecomClient(
+                    self.phone,
+                    auth_data=existing_auth,
+                    device_model=str(existing_model) if existing_model else DEFAULT_TELECOM_MODEL,
+                )
                 ok = await self.hass.async_add_executor_job(self.telecom_client.send_sms)
                 if ok:
                     return await self.async_step_telecom_sms()
@@ -461,7 +479,11 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
         existing_auth = self.target_entry.data.get(CONF_AUTH_DATA) or {}
         existing_model = existing_auth.get("device_model")
         if self._telecom_client is None:
-            self._telecom_client = TelecomClient(phone, auth_data=existing_auth, device_model=existing_model)
+            self._telecom_client = TelecomClient(
+                phone,
+                auth_data=existing_auth,
+                device_model=str(existing_model) if existing_model else DEFAULT_TELECOM_MODEL,
+            )
 
         coord = None
         if DOMAIN in self.hass.data and self.target_entry.entry_id in self.hass.data[DOMAIN]:

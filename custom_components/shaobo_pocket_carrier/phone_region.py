@@ -522,7 +522,7 @@ def set_active_path(path: Optional[str]) -> None:
 def _cache_key(path: str) -> Tuple[str, int, int]:
     try:
         stat = os.stat(path)
-        return (path, int(stat.st_mtime_ns), int(stat.st_size))
+        return (path, stat.st_mtime_ns, stat.st_size)
     except OSError:
         return (path, 0, 0)
 

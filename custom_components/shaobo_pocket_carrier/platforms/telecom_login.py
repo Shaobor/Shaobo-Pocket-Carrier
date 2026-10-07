@@ -75,7 +75,7 @@ async def async_send_login_sms(
             f"登录验证码已下发，请在 {LOGIN_SMS_WAIT_SECONDS} 秒内写入「通话详单验证码」实体"
         )
         # 边界: 验证码可能早于发码请求返回就已写入 (此时窗口尚未开启，不会自动提交)
-        pending = str(runtime.code or "").strip()
+        pending = (runtime.code or "").strip()
         if (
             len(pending) == LOGIN_CODE_LENGTH
             and pending.isdigit()
@@ -103,7 +103,7 @@ async def async_submit_login_code(
     code: str,
 ) -> Tuple[bool, str]:
     """提交短信登录验证码, 成功后恢复账号在线状态"""
-    clean = "".join(str(code or "").split())
+    clean = "".join((code or "").split())
     if len(clean) != LOGIN_CODE_LENGTH or not clean.isdigit():
         msg = f"登录验证码应为 {LOGIN_CODE_LENGTH} 位数字"
         runtime.last_result = msg

@@ -76,6 +76,8 @@ _MIN_AUTO_SUBMIT_CODE_LEN = 4
 class _TelecomCallAuthEntity(CarrierControlEntity):
     """通话详单二次认证实体基类 (公用能力见 platforms/base.CarrierControlEntity)"""
 
+    hass: HomeAssistant
+
 
 class _TelecomCallAuthText(_TelecomCallAuthEntity, TextEntity):
     """二次认证文本实体基类 (姓名 / 身份证号 / 验证码共用)"""
@@ -101,12 +103,22 @@ class _TelecomCallAuthText(_TelecomCallAuthEntity, TextEntity):
         initial: str = "",
     ) -> None:
         super().__init__(hass, coordinator, phone, entry, key, name, icon, platform_domain="text")
+        self._hass: HomeAssistant = hass
         self._hint = hint
         self._runtime_attr = runtime_attr
         self._options_key = options_key
-        self._value = str(initial or "").strip()
+        self._value = (initial or "").strip()
         # 运行时共享状态与配置选项保持一致 (重启后由 options 回填)
         setattr(self._runtime, runtime_attr, self._value)
+
+    @property
+    def hass(self) -> HomeAssistant:
+        """Home Assistant 实例"""
+        return self._hass
+
+    @hass.setter
+    def hass(self, value: HomeAssistant) -> None:
+        self._hass = value
 
     @property
     def native_value(self) -> Optional[str]:
@@ -129,7 +141,7 @@ class _TelecomCallAuthText(_TelecomCallAuthEntity, TextEntity):
 
     async def async_set_value(self, value: str) -> None:
         """写入值 (手机端自动化可调用 text.set_value 服务)"""
-        text = "".join(str(value or "").split())
+        text = "".join((value or "").split())
         self._value = text
         setattr(self._runtime, self._runtime_attr, text)
         self._async_safe_write_state()
@@ -297,6 +309,16 @@ class TelecomCallAuthButton(_TelecomCallAuthEntity, ButtonEntity):
             "mdi:shield-key-outline",
             platform_domain="button",
         )
+        self._hass: HomeAssistant = hass
+
+    @property
+    def hass(self) -> HomeAssistant:
+        """Home Assistant 实例"""
+        return self._hass
+
+    @hass.setter
+    def hass(self, value: HomeAssistant) -> None:
+        self._hass = value
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -476,7 +498,7 @@ class TelecomCallAuthButton(_TelecomCallAuthEntity, ButtonEntity):
             raw = getattr(state, "state", None) if state is not None else None
             if isinstance(raw, str) and raw.strip() and raw not in ("unknown", "unavailable"):
                 return raw.strip()
-        return str(self._runtime.code or "").strip()
+        return (self._runtime.code or "").strip()
 
 class TelecomCallQueryStartDate(_TelecomCallAuthEntity, DateEntity):
     """通话流水查询起始日期 (date 实体，供自动化按月份请求流水)
@@ -501,6 +523,16 @@ class TelecomCallQueryStartDate(_TelecomCallAuthEntity, DateEntity):
             "mdi:calendar-start",
             platform_domain="date",
         )
+        self._hass: HomeAssistant = hass
+
+    @property
+    def hass(self) -> HomeAssistant:
+        """Home Assistant 实例"""
+        return self._hass
+
+    @hass.setter
+    def hass(self, value: HomeAssistant) -> None:
+        self._hass = value
 
     def _current_start_date(self) -> datetime.date:
         """当前生效的查询起始日期 (未设置时跟随当月 1 日)"""
@@ -729,7 +761,7 @@ async def async_start_detail_query(
         )
         # 边界: 短信可能在发送请求返回前就已到达并被写入，此时写入事件早于窗口开启，
         # 不会触发自动提交 —— 这里补一次提交，避免"验证码写了却没反应"
-        pending = str(runtime.code or "").strip()
+        pending = (runtime.code or "").strip()
         if (
             len(pending) >= _MIN_AUTO_SUBMIT_CODE_LEN
             and runtime.code_set_at + 1.0 >= sent_at

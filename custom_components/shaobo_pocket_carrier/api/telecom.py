@@ -66,7 +66,7 @@ def _ascii_decrypt(raw: str) -> str:
 
 def _looks_encrypted(raw: str) -> bool:
     """"13363902861" 被加密后是 "3778612:83" 这种形态 —— 含非数字字符才需要还原"""
-    text = str(raw or "")
+    text = raw or ""
     return bool(text) and not text.isdigit() and not text.startswith("+")
 
 
@@ -162,7 +162,7 @@ def _pick_rows(container: Dict[str, Any]) -> List[Dict[str, Any]]:
     for key, value in container.items():
         if not isinstance(value, list) or not value:
             continue
-        low = str(key).lower()
+        low = (key or "").lower()
         if "total" in low or "sec" in low:
             continue
         if isinstance(value[0], dict):
@@ -175,7 +175,7 @@ def _pick_total_items(container: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(container, dict):
         return []
     for key, value in container.items():
-        if isinstance(value, list) and value and isinstance(value[0], dict) and "total" in str(key).lower():
+        if isinstance(value, list) and value and isinstance(value[0], dict) and "total" in (key or "").lower():
             return value
     return []
 
@@ -281,7 +281,7 @@ def _first_value(row: Dict[str, Any], keys) -> Any:
 def _nested_rows(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     """取按天行里的二级明细列表 (如 *SecList), 没有则返回空"""
     for key, value in row.items():
-        if isinstance(value, list) and value and isinstance(value[0], dict) and "sec" in str(key).lower():
+        if isinstance(value, list) and value and isinstance(value[0], dict) and "sec" in (key or "").lower():
             return [v for v in value if isinstance(v, dict)]
     return []
 
@@ -459,7 +459,12 @@ def locate_notch(bg_b64: str, piece_b64: str):
     return best[1], best[2], best[0], pw, bw
 
 class TelecomClient:
-    def __init__(self, phone: str, auth_data: dict = None, device_model: str = None):
+    def __init__(
+        self,
+        phone: str,
+        auth_data: Optional[Dict[str, Any]] = None,
+        device_model: Optional[str] = None,
+    ):
         self.phone = phone
         self.s = requests.Session()
         self.s.headers.update({
@@ -575,7 +580,7 @@ class TelecomClient:
             "account": ENC(self.phone),
             "queryFlag": "1",
             "isChinatelecom": "1",
-            "type": str(type_value),
+            "type": type_value,
             "startDate": start_date,
             "endDate": end_date,
             "shopId": "20004",
@@ -901,7 +906,7 @@ class TelecomClient:
         if not self.token:
             raise CarrierAuthExpiredError("电信登录凭据缺失，需要重新认证")
 
-        data_out = {}
+        data_out: Dict[str, Any] = {}
         mask = lambda p: p[:3] + "****" + p[-4:] if len(p) == 11 else p
 
         # 1. 话费余额、本月消费与近半年账单
@@ -981,6 +986,7 @@ class TelecomClient:
             data_out["integral"] = 0
 
         # 3. 515G通用大流量池与共享流量 (userPackage + qryShareUsage)
+        share_data: Dict[str, Any] = {}
         ts_cycle = time.strftime("%Y%m")
         try:
             # 3.1 从 userPackage (queryFlag="0") 获取全量流量池总额与剩余
@@ -1203,7 +1209,7 @@ class TelecomClient:
         start_day = 1
 
         if start_date:
-            s = str(start_date).strip()
+            s = (start_date or "").strip()
             # 兼容正则匹配: 2026-08-01, 2026/8/1, 2026.8.1, 2026-08 等
             m_date = re.match(r"^(\d{4})[-/.]?(\d{1,2})(?:[-/.]?(\d{1,2}))?$", s)
             if m_date:
