@@ -518,10 +518,17 @@ class MobileClient:
             "last_update": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+        # 轻量保活心跳：访问移动 H5 主页导航刷新会话活跃度并获取最新 Set-Cookie
+        try:
+            self.s.get(f"{BASE_URL}/website/spa/main/newHome", timeout=8)
+            self._sync_session_cookies()
+        except Exception as e:
+            _LOGGER.debug("移动保活心跳请求异常(忽略): %s", e)
+
         now_ts = str(int(time.time() * 1000))
         success_modules = 0
 
-        # 1. 实时话费与余额查询 (fareBalance)
+        # 1. 实时话费与余额查询 (fareBalance) —— 核心模块
         try:
             fee_res = self._request("GET", f"website/fareBalance?t={now_ts}")
             data_sec = fee_res.get("data") or {}
@@ -536,11 +543,12 @@ class MobileClient:
                 data_out["owe_fee"] = owe_fee
                 success_modules += 1
         except CarrierAuthExpiredError:
-            raise
+            # 话费为第一核心模块，若话费明确报未登录且无法解密，记录警告但不立刻中断，继续尝试流量模块
+            _LOGGER.debug("拉取移动话费报凭证失效，尝试后续核心模块验证")
         except Exception as e:
             _LOGGER.warning("拉取移动话费余额异常: %s", e)
 
-        # 2. 套餐余量查询 (getNewFlow)
+        # 2. 套餐余量查询 (getNewFlow) —— 核心模块
         try:
             flow_res = self._request("GET", f"website/personalHome/getNewFlow?t={now_ts}")
             obj = flow_res.get("object") or {}
@@ -584,7 +592,7 @@ class MobileClient:
                 data_out["flow_packages"] = flow_pkgs
                 success_modules += 1
         except CarrierAuthExpiredError:
-            raise
+            _LOGGER.debug("拉取移动套餐流量报凭证失效")
         except Exception as e:
             _LOGGER.warning("拉取移动套餐流量异常: %s", e)
 
@@ -613,10 +621,8 @@ class MobileClient:
                 if voice_pkgs:
                     data_out["voice_packages"] = voice_pkgs
                 success_modules += 1
-        except CarrierAuthExpiredError:
-            raise
         except Exception as e:
-            _LOGGER.warning("拉取移动通话余量异常: %s", e)
+            _LOGGER.debug("拉取移动通话余量异常(非核心模块，忽略): %s", e)
 
         # 4. 积分查询 (score/news)
         try:
@@ -625,10 +631,8 @@ class MobileClient:
             val = data_score.get("availableScore") or data_score.get("score") or score_res.get("score")
             if val is not None:
                 data_out["integral"] = int(float(val))
-        except CarrierAuthExpiredError:
-            raise
         except Exception as e:
-            _LOGGER.debug("拉取移动积分异常: %s", e)
+            _LOGGER.debug("拉取移动积分异常(非核心模块，忽略): %s", e)
 
         # 5. 个人客户基础档案 (getCustBaseInfo - 机主姓名、入网时间、网龄、主套餐等)
         try:
@@ -675,10 +679,8 @@ class MobileClient:
                 if loc and str(loc).strip():
                     data_out["location"] = str(loc).strip()
                 success_modules += 1
-        except CarrierAuthExpiredError:
-            raise
         except Exception as e:
-            _LOGGER.warning("拉取移动客户基础档案异常: %s", e)
+            _LOGGER.debug("拉取移动客户基础档案异常(非核心模块，忽略): %s", e)
 
         # 6. 星级与资费关键信息补充 (getCustomerKeyMessage)
         try:
@@ -693,13 +695,12 @@ class MobileClient:
 
                 if not data_out.get("speed_service") and key_res.get("tariffPackages"):
                     data_out["speed_service"] = str(key_res["tariffPackages"]).strip()
-        except CarrierAuthExpiredError:
-            raise
         except Exception as e:
-            _LOGGER.debug("拉取移动关键星级信息异常: %s", e)
+            _LOGGER.debug("拉取移动关键星级信息异常(非核心模块，忽略): %s", e)
 
-        # 若没有任何核心模块获取到数据，说明会话凭证已失效或接口被拦截
+        # 只有在核心模块(话费与流量)全部获取失败时，才最终判定为会话过期
         if success_modules == 0:
-            raise CarrierAuthExpiredError("未能从中国移动接口获取到有效业务数据，会话可能已过期")
+            raise CarrierAuthExpiredError("未能从中国移动核心接口获取到有效数据，会话已过期")
 
         return data_out
+

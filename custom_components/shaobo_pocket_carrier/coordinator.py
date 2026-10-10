@@ -853,9 +853,12 @@ class MobileDataUpdateCoordinator(DataUpdateCoordinator):
             # 每次拉取成功后，自动将移动服务端滑动顺延的最新会话凭据持久化存盘
             if self.entry:
                 latest_auth = self.client.export_auth()
-                old_share_token = (self.entry.data.get("auth_data") or {}).get("cookies", {}).get("shareToken")
-                new_share_token = latest_auth.get("cookies", {}).get("shareToken")
-                if new_share_token and new_share_token != old_share_token:
+                old_auth = self.entry.data.get("auth_data") or {}
+                old_cookies = old_auth.get("cookies") or {}
+                new_cookies = latest_auth.get("cookies") or {}
+                # 只要任意 Cookie 发生变化、新增、或原先为空，即时持久化到条目与本地磁盘
+                cookies_changed = any(new_cookies.get(k) != old_cookies.get(k) for k in new_cookies) or (len(new_cookies) != len(old_cookies))
+                if cookies_changed or not old_cookies:
                     new_data = dict(self.entry.data)
                     new_data["auth_data"] = latest_auth
                     self.hass.config_entries.async_update_entry(self.entry, data=new_data)
