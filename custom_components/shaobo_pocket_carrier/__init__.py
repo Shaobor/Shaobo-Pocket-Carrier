@@ -53,7 +53,7 @@ PLATFORMS = [
 ]
 
 URL_CARD = "/shaobo_pocket_carrier/pocket-carrier-card.js"
-VERSION_CARD = "5.11.15"
+VERSION_CARD = "5.11.16"
 # 早期内置的完整版 room-elves-card，文件已移除: 资源里残留的旧地址会 404，启动时一并清掉
 LEGACY_CARD_URLS = ("/shaobo_pocket_carrier/room-elves-card.js",)
 
