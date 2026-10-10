@@ -10,8 +10,10 @@ from homeassistant.helpers.storage import Store
 from .const import (
     CARRIER_TELECOM,
     CARRIER_UNICOM,
+    CARRIER_MOBILE,
     STORAGE_KEY_TELECOM,
     STORAGE_KEY_UNICOM,
+    STORAGE_KEY_MOBILE,
     STORAGE_KEY_CALL_CACHE,
     STORAGE_VERSION,
 )
@@ -19,7 +21,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # 通话流水缓存文件的所有读写都走这把锁：
-# 多个手机号(电信/联通)共用同一个 JSON 文件，读-改-写不加锁会互相覆盖丢失条目
+# 多个手机号(电信/联通/移动)共用同一个 JSON 文件，读-改-写不加锁会互相覆盖丢失条目
 _CACHE_LOCK = asyncio.Lock()
 
 def _get_storage_key(carrier: str) -> str:
@@ -28,6 +30,8 @@ def _get_storage_key(carrier: str) -> str:
         return STORAGE_KEY_TELECOM
     elif carrier == CARRIER_UNICOM:
         return STORAGE_KEY_UNICOM
+    elif carrier == CARRIER_MOBILE:
+        return STORAGE_KEY_MOBILE
     return f"Shaobo_{carrier.capitalize()}"
 
 async def async_save_carrier_account(hass: HomeAssistant, carrier: str, phone: str, auth_data: dict) -> None:

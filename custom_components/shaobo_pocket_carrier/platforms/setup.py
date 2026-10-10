@@ -17,6 +17,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from ..const import (
     CARRIER_TELECOM,
     CARRIER_UNICOM,
+    CARRIER_MOBILE,
     CONF_CARRIER,
     CONF_PHONE,
     DOMAIN,
@@ -27,6 +28,11 @@ from .auto_query import (
     create_auto_query_time,
     create_daily_reset_switch,
 )
+from .mobile_auth import (
+    create_mobile_auth_button_entity,
+    create_mobile_auth_text_entity,
+)
+from .mobile_sensor import get_mobile_sensors
 from .overview import create_overview_sensor
 from .region_db import create_region_auto_switch, create_region_update_button
 from .telecom_auth import (
@@ -74,6 +80,9 @@ async def async_setup_carrier_sensors(
     elif carrier == CARRIER_UNICOM:
         _LOGGER.debug("正在为联通手机号 %s 注册专属传感器模块", phone)
         sensors = get_unicom_sensors(coordinator, phone)
+    elif carrier == CARRIER_MOBILE:
+        _LOGGER.debug("正在为移动手机号 %s 注册专属传感器模块", phone)
+        sensors = get_mobile_sensors(coordinator, phone, entry=entry)
     else:
         _LOGGER.error("未知的运营商类型: %s", carrier)
         return
@@ -92,17 +101,24 @@ async def async_setup_carrier_texts(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """文本平台: 仅中国电信需要通话详单二次认证参数 (姓名 / 身份证号 / 验证码)"""
+    """文本平台: 电信通话详单二次认证参数 (姓名/身份证号/验证码); 移动短信登录验证码"""
     context = get_carrier_context(hass, entry)
-    if context is None or context[1] != CARRIER_TELECOM:
+    if context is None:
         return
-    coordinator, _carrier, phone = context
+    coordinator, carrier, phone = context
 
-    _LOGGER.debug("正在为电信手机号 %s 注册通话详单二次认证参数实体", phone)
-    async_add_entities(
-        create_call_auth_text_entities(hass, coordinator, phone, entry),
-        update_before_add=False,
-    )
+    if carrier == CARRIER_TELECOM:
+        _LOGGER.debug("正在为电信手机号 %s 注册通话详单二次认证参数实体", phone)
+        async_add_entities(
+            create_call_auth_text_entities(hass, coordinator, phone, entry),
+            update_before_add=False,
+        )
+    elif carrier == CARRIER_MOBILE:
+        _LOGGER.debug("正在为移动手机号 %s 注册短信登录验证码实体", phone)
+        async_add_entities(
+            [create_mobile_auth_text_entity(hass, coordinator, phone, entry)],
+            update_before_add=False,
+        )
 
 
 async def async_setup_carrier_buttons(
@@ -110,7 +126,7 @@ async def async_setup_carrier_buttons(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """按钮平台: 归属地库更新按钮通用; 电信: 通话详单二次认证按钮; 联通: 刷新详单流水按钮"""
+    """按钮平台: 归属地库更新按钮通用; 电信: 通话详单二次认证按钮; 联通: 刷新详单流水按钮; 移动: 短信登录按钮"""
     context = get_carrier_context(hass, entry)
     if context is None:
         return
@@ -121,6 +137,8 @@ async def async_setup_carrier_buttons(
         buttons.append(create_call_auth_button_entity(hass, coordinator, phone, entry))
     elif carrier == CARRIER_UNICOM:
         buttons.append(create_detail_refresh_button(hass, coordinator, phone, entry))
+    elif carrier == CARRIER_MOBILE:
+        buttons.append(create_mobile_auth_button_entity(hass, coordinator, phone, entry))
 
     _LOGGER.debug("正在为 %s 手机号 %s 注册按钮实体 (共 %d 个)", carrier, phone, len(buttons))
     async_add_entities(buttons, update_before_add=False)
@@ -131,11 +149,15 @@ async def async_setup_carrier_dates(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """日期平台: 通话详单查询起始日期 (电信/联通通用)"""
+    """日期平台: 通话详单查询起始日期 (仅电信/联通，移动已无详单功能)"""
     context = get_carrier_context(hass, entry)
     if context is None:
         return
     coordinator, carrier, phone = context
+
+    # 中国移动已移除详单功能，不再创建"通话详单查询起始日期"实体
+    if carrier == CARRIER_MOBILE:
+        return
 
     _LOGGER.debug("正在为 %s 手机号 %s 注册通话详单查询起始日期实体", carrier, phone)
     async_add_entities(
@@ -149,19 +171,28 @@ async def async_setup_carrier_switches(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """开关平台: 自动获取通话记录 / 每日重置查询起始日期 / 自动更新归属地库 (通用); 自动短信登录 (仅电信)"""
+    """开关平台: 自动获取通话记录 / 每日重置查询起始日期 / 自动更新归属地库 (通用); 自动短信登录 (电信与移动)"""
     context = get_carrier_context(hass, entry)
     if context is None:
         return
     coordinator, carrier, phone = context
 
+    # 中国移动已移除通话记录功能，注册归属地自动更新开关和自动短信登录开关
+    if carrier == CARRIER_MOBILE:
+        switches = [
+            create_region_auto_switch(hass, coordinator, phone, entry),
+            create_auto_login_switch(hass, coordinator, phone, entry),
+        ]
+        _LOGGER.debug("正在为移动手机号 %s 注册开关实体 (共 %d 个)", phone, len(switches))
+        async_add_entities(switches, update_before_add=False)
+        return
+
     switches = [
         create_auto_query_switch(hass, coordinator, phone, entry),
         create_daily_reset_switch(hass, coordinator, phone, entry),
         create_region_auto_switch(hass, coordinator, phone, entry),
+        create_auto_login_switch(hass, coordinator, phone, entry),
     ]
-    if carrier == CARRIER_TELECOM:
-        switches.append(create_auto_login_switch(hass, coordinator, phone, entry))
 
     _LOGGER.debug("正在为 %s 手机号 %s 注册开关实体 (共 %d 个)", carrier, phone, len(switches))
     async_add_entities(switches, update_before_add=False)
@@ -172,11 +203,15 @@ async def async_setup_carrier_times(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """时间平台: 自动获取通话记录时间 (电信/联通通用)"""
+    """时间平台: 自动获取通话记录时间 (仅电信/联通，移动已无此功能)"""
     context = get_carrier_context(hass, entry)
     if context is None:
         return
     coordinator, carrier, phone = context
+
+    # 中国移动已无通话记录功能，不注册自动获取时间实体
+    if carrier == CARRIER_MOBILE:
+        return
 
     _LOGGER.debug("正在为 %s 手机号 %s 注册自动获取通话记录时间实体", carrier, phone)
     async_add_entities(

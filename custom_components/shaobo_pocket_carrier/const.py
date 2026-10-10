@@ -4,10 +4,12 @@ DOMAIN = "shaobo_pocket_carrier"
 
 CARRIER_TELECOM = "telecom"
 CARRIER_UNICOM = "unicom"
+CARRIER_MOBILE = "mobile"
 
 CARRIER_NAMES = {
     CARRIER_TELECOM: "中国电信",
     CARRIER_UNICOM: "中国联通",
+    CARRIER_MOBILE: "中国移动",
 }
 
 CONF_CARRIER = "carrier"
@@ -25,9 +27,11 @@ CALL_AUTH_EXPIRE_SECONDS = 1800              # 详单二次认证有效期 30 �
 CONF_AUTH_ACTION = "auth_action"          # 选项流中触发的认证动作
 AUTH_ACTION_NONE = "none"                # 不执行认证
 AUTH_ACTION_CALL_AUTH = "call_auth"      # 通话记录二次认证
+
 MIN_SCAN_INTERVAL = 5                   # 最低禁止小于 5 分钟
 DEFAULT_SCAN_INTERVAL_TELECOM = 30  # 电信默认 30 分钟
 DEFAULT_SCAN_INTERVAL_UNICOM = 10   # 联通默认 10 分钟
+DEFAULT_SCAN_INTERVAL_MOBILE = 10   # 移动默认 10 分钟
 
 # 传感器键名
 SENSOR_BALANCE = "balance"              # 话费余额
@@ -192,6 +196,7 @@ UNICOM_FAILURE_RETRY_SECONDS = 60  # 联通刷新首次失败 (如接口超时) 
 # 专属持久化存储文件名 (位于 <HA配置目录>/.storage/ 下)
 STORAGE_KEY_TELECOM = "Shaobo_Telecom"
 STORAGE_KEY_UNICOM = "Shaobo_Unicom"
+STORAGE_KEY_MOBILE = "Shaobo_Mobile"
 STORAGE_VERSION = 1
 
 # 通话流水(语音详单)本地缓存文件: 二次认证 30 分钟有效期内落盘，

@@ -7,6 +7,7 @@ import time
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -17,6 +18,7 @@ from .const import (
     UPDATE_INTERVAL_UNICOM,
     CARRIER_TELECOM,
     CARRIER_UNICOM,
+    CARRIER_MOBILE,
     CarrierAuthExpiredError,
     CONF_SCAN_INTERVAL,
     CONF_CALL_START_DATE,
@@ -29,8 +31,10 @@ from .const import (
     MIN_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_TELECOM,
     DEFAULT_SCAN_INTERVAL_UNICOM,
+    DEFAULT_SCAN_INTERVAL_MOBILE,
     UNICOM_FAILURE_RETRY_SECONDS,
 )
+from .api.mobile import MobileClient
 from .api.telecom import TelecomClient
 from .api.unicom import UnicomClient, month_range, resolve_query_month
 from .storage import async_save_carrier_account, CallRecordCache
@@ -714,3 +718,210 @@ class UnicomDataUpdateCoordinator(DataUpdateCoordinator):
                 f"联通接口通信失败: {err}",
                 retry_after=UNICOM_FAILURE_RETRY_SECONDS if self.last_update_success else None,
             ) from err
+
+
+class MobileDataUpdateCoordinator(DataUpdateCoordinator):
+    """中国移动独立数据协调器 (Cookie 会话长效保活，定时轮询与自动登录)"""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        phone: str,
+        auth_data: dict,
+        entry: Optional[ConfigEntry] = None,
+    ) -> None:
+        self.phone = phone
+        self.entry = entry
+        self.client = MobileClient(phone, auth_data)
+        self._client_lock = asyncio.Lock()
+        self.login_expired = False
+        self.last_auth_error = ""
+
+        interval_min = DEFAULT_SCAN_INTERVAL_MOBILE
+        if entry:
+            try:
+                interval_min = int(
+                    entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_MOBILE)
+                )
+            except Exception:
+                interval_min = DEFAULT_SCAN_INTERVAL_MOBILE
+
+        interval_min = max(MIN_SCAN_INTERVAL, interval_min)
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"China Mobile ({phone})",
+            update_interval=timedelta(minutes=interval_min),
+        )
+
+    @callback
+    def _mark_login_expired(self, reason: str) -> None:
+        """标记登录态失效, 并只在状态翻转时抛出 EVENT_LOGIN_EXPIRED 事件 (供自动登录模块监听)"""
+        first_time = not self.login_expired
+        self.login_expired = True
+        self.last_auth_error = reason
+        if first_time:
+            self.hass.bus.async_fire(
+                EVENT_LOGIN_EXPIRED,
+                {
+                    "entry_id": self.entry.entry_id if self.entry else "",
+                    "phone": self.phone,
+                    "reason": reason,
+                },
+            )
+
+    @callback
+    def _mark_login_alive(self) -> None:
+        """本轮拉取成功, 清除登录失效标记"""
+        if self.login_expired:
+            _LOGGER.info("移动手机号 %s 登录态已恢复正常", self.phone)
+        self.login_expired = False
+        self.last_auth_error = ""
+
+    @callback
+    def mark_login_revived(self) -> None:
+        """登录成功后由登录模块调用, 恢复协调器登录态标记"""
+        self._mark_login_alive()
+
+    @callback
+    def _async_start_reauth(self) -> None:
+        """启动 Home Assistant 官方"重新认证"入口 (已有进行中的流程则不重复)"""
+        if not self.entry:
+            return
+        try:
+            for flow in self.hass.config_entries.flow.async_progress_by_handler(DOMAIN):
+                context = flow.get("context") or {}
+                if context.get("entry_id") != self.entry.entry_id:
+                    continue
+                # 只把"重新认证"流程视为已存在: 用户此刻打开的选项流不应阻止重新认证入口出现
+                if str(flow.get("step_id", "")).startswith("reauth"):
+                    return
+        except Exception as err:
+            _LOGGER.debug("检查进行中的重新认证流程失败: %s", err)
+
+        try:
+            self.entry.async_start_reauth(self.hass)
+            _LOGGER.info("已为中国移动手机号 %s 启动官方重新认证流程", self.phone)
+        except Exception as err:
+            _LOGGER.debug("启动中国移动重新认证流程失败(忽略): %s", err)
+
+    async def _async_handle_login_expired(self, reason: str) -> Dict[str, Any]:
+        """登录凭证失效时的降级处理
+
+        返回上一份可用数据 + 打上"登录已失效"标记：
+        - 数据类传感器保持可用 (显示上次数据并给出状态提示)，不会整片变 unavailable
+        - 开关 / 文本 / 按钮等控制实体得以保留，可自动或手动完成短信登录
+        - 同时启动 Home Assistant 官方重新认证入口 (选项流那条路仍可用)
+        """
+        first_time = not self.login_expired
+        self._mark_login_expired(reason)
+
+        if first_time:
+            _LOGGER.warning(
+                "中国移动手机号 %s 凭证已失效，条目保持在线以便自动/手动重新登录: %s",
+                self.phone,
+                reason,
+            )
+            self._async_start_reauth()
+        else:
+            _LOGGER.debug("中国移动手机号 %s 仍处于凭证失效状态: %s", self.phone, reason)
+
+        fallback: Dict[str, Any] = dict(self.data) if isinstance(self.data, dict) else {}
+        fallback["login_expired"] = True
+        fallback["login_error"] = reason
+        fallback["account_status"] = "凭证已失效 (需重新登录)"
+        fallback["online"] = "离线"
+        return fallback
+
+    async def _async_update_data(self) -> Dict[str, Any]:
+        """异步拉取中国移动数据
+
+        对齐电信协调器的降级策略:
+        - 凭证失效 (CarrierAuthExpiredError) → 不抛 ConfigEntryAuthFailed，
+          降级返回上次数据 + 标记 login_expired，抛出登录失效事件，
+          同时触发 HA 官方"重新认证"入口
+        - 一般通信异常 → 返回上次数据，避免 last_update_success=False 把所有实体标为 unavailable
+        """
+        try:
+            async with self._client_lock:
+                data = await self.hass.async_add_executor_job(self.client.fetch_all_data)
+            if not data or not isinstance(data, dict):
+                raise ValueError("中国移动接口返回空数据")
+            self._mark_login_alive()
+
+            # 每次拉取成功后，自动将移动服务端滑动顺延的最新会话凭据持久化存盘
+            if self.entry:
+                latest_auth = self.client.export_auth()
+                old_share_token = (self.entry.data.get("auth_data") or {}).get("cookies", {}).get("shareToken")
+                new_share_token = latest_auth.get("cookies", {}).get("shareToken")
+                if new_share_token and new_share_token != old_share_token:
+                    new_data = dict(self.entry.data)
+                    new_data["auth_data"] = latest_auth
+                    self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+                    from .storage import async_save_carrier_account
+                    from .const import CARRIER_MOBILE
+                    self.hass.async_create_task(
+                        async_save_carrier_account(self.hass, CARRIER_MOBILE, self.phone, latest_auth)
+                    )
+
+            return data
+        except CarrierAuthExpiredError as auth_err:
+            return await self._async_handle_login_expired(str(auth_err))
+        except Exception as err:
+            # 一般通信异常: 降级返回上次数据，避免整批实体变 unavailable
+            _LOGGER.warning(
+                "拉取中国移动手机号 %s 数据异常 (已保留上次数据): %s", self.phone, err
+            )
+            if isinstance(self.data, dict) and self.data:
+                return dict(self.data)
+            # 首次拉取就失败: 没有上次数据，返回空字典让实体显示初始默认值
+            return {}
+
+    async def async_send_login_sms(self) -> tuple[bool, str]:
+        """下发中国移动登录短信验证码"""
+        try:
+            async with self._client_lock:
+                ok, msg = await self.hass.async_add_executor_job(self.client.send_sms)
+        except Exception as err:
+            _LOGGER.warning("移动手机号 %s 下发登录验证码异常: %s", self.phone, err)
+            return False, f"请求异常 ({err})"
+
+        if ok:
+            _LOGGER.info("移动手机号 %s 登录验证码短信已下发: %s", self.phone, msg)
+            return True, msg or "登录验证码短信已下发"
+        return False, msg or "短信下发失败，请稍后重试"
+
+    async def async_login_with_sms(self, code: str) -> tuple[bool, str]:
+        """用短信验证码完成移动绑定登录 (成功时 client 内部已装载新 Cookie)"""
+        try:
+            async with self._client_lock:
+                ok, msg = await self.hass.async_add_executor_job(self.client.login_with_sms, code)
+        except Exception as err:
+            _LOGGER.warning("移动手机号 %s 短信登录异常: %s", self.phone, err)
+            return False, f"请求异常 ({err})"
+
+        if ok:
+            return True, "登录成功"
+        return False, msg or "验证码错误或已过期"
+
+    async def async_probe_login_state(self) -> str:
+        """主动探活中国移动登录态
+
+        返回 "ok" / "expired" / "error"
+        """
+        if self.login_expired:
+            return "expired"
+        try:
+            async with self._client_lock:
+                await self.hass.async_add_executor_job(self.client.get_cust_base_info)
+            self._mark_login_alive()
+            return "ok"
+        except CarrierAuthExpiredError as auth_err:
+            self._mark_login_expired(str(auth_err))
+            return "expired"
+        except Exception as err:
+            _LOGGER.debug("探活移动手机号 %s 网络异常: %s", self.phone, err)
+            return "error"
+
+

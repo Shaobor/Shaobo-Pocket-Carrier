@@ -15,7 +15,9 @@ from .const import (
     DOMAIN,
     CARRIER_TELECOM,
     CARRIER_UNICOM,
+    CARRIER_MOBILE,
     CARRIER_NAMES,
+    CarrierAuthExpiredError,
     CONF_CARRIER,
     CONF_PHONE,
     CONF_AUTH_DATA,
@@ -33,10 +35,12 @@ from .const import (
     MIN_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_TELECOM,
     DEFAULT_SCAN_INTERVAL_UNICOM,
+    DEFAULT_SCAN_INTERVAL_MOBILE,
 )
+from .api.mobile import MobileClient, parse_mobile_auth_data
 from .api.telecom import TelecomClient, TELECOM_DEVICE_MODELS, DEFAULT_TELECOM_MODEL
 from .api.unicom import UnicomClient
-from .views import SLIDER_SESSIONS, CarrierSliderPageView, CarrierSliderVerifyView
+from .views import SLIDER_SESSIONS, CarrierSliderPageView, CarrierSliderVerifyView, CarrierMobileTutorialView
 from .storage import async_save_carrier_account
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,56 +55,18 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.phone: str = ""
         self.telecom_client: Optional[TelecomClient] = None
         self.unicom_client: Optional[UnicomClient] = None
+        self.mobile_client: Optional[MobileClient] = None
 
     async def async_step_user(self, user_input=None):
-        """步骤1: 选择运营商与输入手机号"""
-        errors = {}
-
+        """步骤1: 下拉选择运营商网络"""
         if user_input is not None:
             self.carrier = user_input[CONF_CARRIER]
-            self.phone = user_input[CONF_PHONE].strip()
-
-            if len(self.phone) != 11 or not self.phone.isdigit():
-                errors["base"] = "invalid_phone"
-            else:
-                # 检查该手机号是否已被配置 (关闭 raise_on_progress 允许用户随时重新发起配置)
-                unique_id = f"{self.carrier}_{self.phone}"
-                await self.async_set_unique_id(unique_id, raise_on_progress=False)
-                self._abort_if_unique_id_configured()
-
-                if self.carrier == CARRIER_TELECOM:
-                    # 电信分支：随机抽取真实 iPhone 设备型号，实现不同账号指纹独立
-                    random_model = random.choice(TELECOM_DEVICE_MODELS)
-                    self.telecom_client = TelecomClient(self.phone, device_model=random_model)
-                    ok = await self.hass.async_add_executor_job(self.telecom_client.send_sms)
-                    if ok:
-                        return await self.async_step_telecom_sms()
-                    else:
-                        errors["base"] = "sms_send_failed"
-
-                elif self.carrier == CARRIER_UNICOM:
-                    # 联通分支：确保视图已注册
-                    domain_data = self.hass.data.setdefault(DOMAIN, {})
-                    if not domain_data.get("views_registered"):
-                        self.hass.http.register_view(CarrierSliderPageView())
-                        self.hass.http.register_view(CarrierSliderVerifyView())
-                        domain_data["views_registered"] = True
-
-                    # 触发风控并准备滑块
-                    self.unicom_client = UnicomClient(self.phone)
-                    try:
-                        await self.hass.async_add_executor_job(self.unicom_client.trigger_risk)
-                        app_id = await self.hass.async_add_executor_job(self.unicom_client.prepare_captcha)
-                        SLIDER_SESSIONS[self.flow_id] = {
-                            "client": self.unicom_client,
-                            "app_id": app_id,
-                            "mobile_hex": self.unicom_client.mobile_hex,
-                            "status": "pending",
-                        }
-                        return await self.async_step_unicom_slider()
-                    except Exception as err:
-                        _LOGGER.error("联通风控预处理失败: %s", err)
-                        errors["base"] = "unicom_risk_failed"
+            if self.carrier == CARRIER_TELECOM:
+                return await self.async_step_telecom()
+            elif self.carrier == CARRIER_UNICOM:
+                return await self.async_step_unicom()
+            elif self.carrier == CARRIER_MOBILE:
+                return await self.async_step_mobile()
 
         schema = vol.Schema({
             vol.Required(CONF_CARRIER, default=CARRIER_TELECOM): selector.SelectSelector(
@@ -108,20 +74,216 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     options=[
                         {"label": "中国电信", "value": CARRIER_TELECOM},
                         {"label": "中国联通", "value": CARRIER_UNICOM},
+                        {"label": "中国移动", "value": CARRIER_MOBILE},
                     ],
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
-            ),
-            vol.Required(CONF_PHONE): selector.TextSelector(
-                selector.TextSelectorConfig(type=selector.TextSelectorType.TEL)
             ),
         })
 
         return self.async_show_form(
             step_id="user",
             data_schema=schema,
+        )
+
+    async def async_step_telecom(self, user_input=None):
+        """步骤2 (电信): 输入手机号码并发送短信"""
+        self.carrier = CARRIER_TELECOM
+        errors = {}
+
+        if user_input is not None:
+            self.phone = user_input[CONF_PHONE].strip()
+            if len(self.phone) != 11 or not self.phone.isdigit():
+                errors["base"] = "invalid_phone"
+            else:
+                unique_id = f"{self.carrier}_{self.phone}"
+                await self.async_set_unique_id(unique_id, raise_on_progress=False)
+                self._abort_if_unique_id_configured()
+
+                random_model = random.choice(TELECOM_DEVICE_MODELS)
+                self.telecom_client = TelecomClient(self.phone, device_model=random_model)
+                ok = await self.hass.async_add_executor_job(self.telecom_client.send_sms)
+                if ok:
+                    return await self.async_step_telecom_sms()
+                else:
+                    errors["base"] = "sms_send_failed"
+
+        schema = vol.Schema({
+            vol.Required(CONF_PHONE): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.TEL)
+            ),
+        })
+        return self.async_show_form(
+            step_id="telecom",
+            data_schema=schema,
             errors=errors,
-            description_placeholders={"carrier_names": "中国电信 / 中国联通"},
+        )
+
+    async def async_step_unicom(self, user_input=None):
+        """步骤2 (联通): 输入手机号码并准备滑块"""
+        self.carrier = CARRIER_UNICOM
+        errors = {}
+
+        if user_input is not None:
+            self.phone = user_input[CONF_PHONE].strip()
+            if len(self.phone) != 11 or not self.phone.isdigit():
+                errors["base"] = "invalid_phone"
+            else:
+                unique_id = f"{self.carrier}_{self.phone}"
+                await self.async_set_unique_id(unique_id, raise_on_progress=False)
+                self._abort_if_unique_id_configured()
+
+                domain_data = self.hass.data.setdefault(DOMAIN, {})
+                if not domain_data.get("views_registered"):
+                    self.hass.http.register_view(CarrierSliderPageView())
+                    self.hass.http.register_view(CarrierSliderVerifyView())
+                    domain_data["views_registered"] = True
+
+                self.unicom_client = UnicomClient(self.phone)
+                try:
+                    await self.hass.async_add_executor_job(self.unicom_client.trigger_risk)
+                    app_id = await self.hass.async_add_executor_job(self.unicom_client.prepare_captcha)
+                    SLIDER_SESSIONS[self.flow_id] = {
+                        "client": self.unicom_client,
+                        "app_id": app_id,
+                        "mobile_hex": self.unicom_client.mobile_hex,
+                        "status": "pending",
+                    }
+                    return await self.async_step_unicom_slider()
+                except Exception as err:
+                    _LOGGER.error("联通风控预处理失败: %s", err)
+                    errors["base"] = "unicom_risk_failed"
+
+        schema = vol.Schema({
+            vol.Required(CONF_PHONE): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.TEL)
+            ),
+        })
+        return self.async_show_form(
+            step_id="unicom",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    def _get_tutorial_url(self) -> str:
+        """获取中国移动抓包教程在新窗口打开的跨源/外部访问 URL"""
+        domain_data = self.hass.data.setdefault(DOMAIN, {})
+        if not domain_data.get("views_registered"):
+            try:
+                self.hass.http.register_view(CarrierSliderPageView)
+                self.hass.http.register_view(CarrierSliderVerifyView)
+                self.hass.http.register_view(CarrierMobileTutorialView)
+                domain_data["views_registered"] = True
+            except Exception:
+                pass
+
+        req_host = ""
+        req_scheme = "http"
+        try:
+            from homeassistant.components.http import current_request
+            req = current_request.get()
+            if req and req.host:
+                req_host = req.host
+                req_scheme = req.scheme or "http"
+        except Exception:
+            pass
+
+        if "127.0.0.1" in req_host:
+            target_host = req_host.replace("127.0.0.1", "localhost")
+        elif "localhost" in req_host:
+            target_host = req_host.replace("localhost", "127.0.0.1")
+        elif req_host:
+            target_host = req_host
+        else:
+            target_host = "localhost:8123"
+
+        return f"{req_scheme}://{target_host}/api/shaobo_pocket_carrier/mobile_tutorial"
+
+    async def async_step_mobile(self, user_input=None):
+        """步骤2 (移动): 输入手机号码并发送短信验证码"""
+        self.carrier = CARRIER_MOBILE
+        errors = {}
+        description_placeholders = {}
+
+        if user_input is not None:
+            self.phone = user_input[CONF_PHONE].strip()
+            if len(self.phone) != 11 or not self.phone.isdigit():
+                errors["base"] = "invalid_phone"
+            else:
+                unique_id = f"{self.carrier}_{self.phone}"
+                await self.async_set_unique_id(unique_id, raise_on_progress=False)
+                self._abort_if_unique_id_configured()
+
+                self.mobile_client = await self.hass.async_add_executor_job(MobileClient, self.phone)
+                ok, msg = await self.hass.async_add_executor_job(self.mobile_client.send_sms)
+                if ok:
+                    return await self.async_step_mobile_sms()
+                else:
+                    _LOGGER.warning("移动手机号 %s 发送验证码失败: %s", self.phone, msg)
+                    errors["base"] = "carrier_api_error"
+                    description_placeholders["error_detail"] = msg or "短信下发未成功，请稍后再试"
+
+        schema = vol.Schema({
+            vol.Required(CONF_PHONE): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.TEL)
+            ),
+        })
+        return self.async_show_form(
+            step_id="mobile",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders=description_placeholders,
+        )
+
+    async def async_step_mobile_sms(self, user_input=None):
+        """步骤3 (移动): 输入 6 位短信验证码完成绑定"""
+        errors = {}
+        description_placeholders = {}
+
+        if user_input is not None:
+            sms_code = user_input.get("sms_code", "").strip()
+            if not self.mobile_client:
+                errors["base"] = "unknown"
+            else:
+                ok, msg = await self.hass.async_add_executor_job(self.mobile_client.login_with_sms, sms_code)
+                if ok:
+                    auth_data = self.mobile_client.export_auth()
+                    await async_save_carrier_account(self.hass, CARRIER_MOBILE, self.phone, auth_data)
+
+                    if hasattr(self, "_reauth_entry") and self._reauth_entry:
+                        return self.async_update_reload_and_abort(
+                            self._reauth_entry,
+                            data_updates={
+                                CONF_AUTH_DATA: auth_data,
+                            },
+                        )
+
+                    return self.async_create_entry(
+                        title=f"中国移动 ({self.phone})",
+                        data={
+                            CONF_CARRIER: CARRIER_MOBILE,
+                            CONF_PHONE: self.phone,
+                            CONF_AUTH_DATA: auth_data,
+                        },
+                    )
+                else:
+                    _LOGGER.warning("移动手机号 %s 短信验证码登录失败: %s", self.phone, msg)
+                    errors["base"] = "carrier_api_error"
+                    description_placeholders["error_detail"] = msg or "短信验证码错误或已失效"
+
+        schema = vol.Schema({
+            vol.Required("sms_code"): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
+            ),
+        })
+
+        desc_placeholders = {"phone": self.phone}
+        desc_placeholders.update(description_placeholders)
+        return self.async_show_form(
+            step_id="mobile_sms",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders=desc_placeholders,
         )
 
     async def async_step_telecom_sms(self, user_input=None):
@@ -254,6 +416,59 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
+    async def async_step_mobile_cookie(self, user_input=None):
+        """步骤2 (移动): 输入抓包 Cookie / 凭据"""
+        errors = {}
+        if user_input is not None:
+            raw_cookie = user_input.get("cookie", "").strip()
+            auth_data = parse_mobile_auth_data(raw_cookie)
+            if not auth_data.get("cookie") and not auth_data.get("xk"):
+                errors["base"] = "invalid_cookie"
+            else:
+                # 尝试连通性校验
+                test_client = MobileClient(self.phone, auth_data)
+                try:
+                    await self.hass.async_add_executor_job(test_client.fetch_all_data)
+                except CarrierAuthExpiredError as auth_err:
+                    _LOGGER.warning("移动凭据验证失败: %s", auth_err)
+                    errors["base"] = "mobile_auth_failed"
+                except Exception as err:
+                    _LOGGER.warning("移动接口连通性测试异常(仍尝试保存): %s", err)
+
+                if not errors:
+                    await async_save_carrier_account(self.hass, CARRIER_MOBILE, self.phone, auth_data)
+                    if hasattr(self, "_reauth_entry") and self._reauth_entry:
+                        return self.async_update_reload_and_abort(
+                            self._reauth_entry,
+                            data_updates={
+                                CONF_AUTH_DATA: auth_data,
+                            },
+                        )
+
+                    return self.async_create_entry(
+                        title=f"中国移动 ({self.phone})",
+                        data={
+                            CONF_CARRIER: CARRIER_MOBILE,
+                            CONF_PHONE: self.phone,
+                            CONF_AUTH_DATA: auth_data,
+                        },
+                    )
+
+        schema = vol.Schema({
+            vol.Required("cookie"): selector.TextSelector(
+                selector.TextSelectorConfig(multiline=True)
+            )
+        })
+        return self.async_show_form(
+            step_id="mobile_cookie",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={
+                "phone": self.phone,
+                "tutorial_url": self._get_tutorial_url(),
+            },
+        )
+
     async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> config_entries.ConfigFlowResult:
         """步骤 Reauth: 处理 Home Assistant 官方触发的重新认证"""
         self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
@@ -265,7 +480,25 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """步骤 Reauth Confirm: 提示用户并启动滑块与短信登录流程"""
         errors = {}
         if user_input is not None:
-            if self.carrier == CARRIER_UNICOM:
+            if self.carrier == CARRIER_MOBILE:
+                self.mobile_client = MobileClient(self.phone)
+                domain_data = self.hass.data.setdefault(DOMAIN, {})
+                if not domain_data.get("views_registered"):
+                    self.hass.http.register_view(CarrierSliderPageView())
+                    self.hass.http.register_view(CarrierSliderVerifyView())
+                    domain_data["views_registered"] = True
+                ok, msg = await self.hass.async_add_executor_job(self.mobile_client.send_sms)
+                if ok:
+                    return await self.async_step_mobile_sms()
+                else:
+                    SLIDER_SESSIONS[self.flow_id] = {
+                        "carrier": CARRIER_MOBILE,
+                        "client": self.mobile_client,
+                        "phone": self.phone,
+                        "status": "pending",
+                    }
+                    return await self.async_step_mobile_slider()
+            elif self.carrier == CARRIER_UNICOM:
                 self.unicom_client = UnicomClient(self.phone)
                 SLIDER_SESSIONS[self.flow_id] = self.unicom_client
                 return await self.async_step_unicom_slider()
@@ -356,6 +589,7 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                     user_input[CONF_OVERVIEW_CALL_LIMIT] = OVERVIEW_CALL_LIMIT_DEFAULT
 
             auth_action = user_input.pop(CONF_AUTH_ACTION, AUTH_ACTION_NONE)
+            need_reload = False
             if not errors:
                 if carrier == CARRIER_TELECOM:
                     selected_date = str(user_input.get(CONF_CALL_START_DATE, "") or "").strip()
@@ -365,6 +599,7 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                     if not selected_date or selected_date == today_first:
                         user_input[CONF_CALL_START_DATE] = ""
 
+            if not errors:
                 new_options = dict(self.target_entry.options)
                 new_options.update(user_input)
                 self._options_data = new_options
@@ -372,6 +607,11 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                 # 仅电信支持认证操作流转
                 if auth_action == AUTH_ACTION_CALL_AUTH:
                     return await self.async_step_telecom_call_auth()
+
+                if need_reload:
+                    self.hass.async_create_task(
+                        self.hass.config_entries.async_reload(self.target_entry.entry_id)
+                    )
 
                 return self.async_create_entry(title="", data=self._options_data)
 
@@ -439,27 +679,45 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                 )
             )
 
-        # 通用选项: 数据总览实体里保留的通话流水条数 (0 = 全部保留)
-        try:
-            current_limit = int(
-                self.target_entry.options.get(
-                    CONF_OVERVIEW_CALL_LIMIT, OVERVIEW_CALL_LIMIT_DEFAULT
+        elif carrier == CARRIER_MOBILE:
+            current_interval = int(self.target_entry.options.get(
+                CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_MOBILE
+            ))
+            current_interval = max(MIN_SCAN_INTERVAL, current_interval)
+            schema_dict[
+                vol.Optional(CONF_SCAN_INTERVAL, default=current_interval)
+            ] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=1,
+                    max=1440,
+                    step=1,
+                    unit_of_measurement="分钟",
+                    mode=selector.NumberSelectorMode.BOX,
                 )
-                or 0
             )
-        except Exception:
-            current_limit = OVERVIEW_CALL_LIMIT_DEFAULT
-        schema_dict[
-            vol.Optional(CONF_OVERVIEW_CALL_LIMIT, default=current_limit)
-        ] = selector.NumberSelector(
-            selector.NumberSelectorConfig(
-                min=0,
-                max=5000,
-                step=1,
-                unit_of_measurement="条",
-                mode=selector.NumberSelectorMode.BOX,
+
+        # 仅电信和联通显示通话流水条数限制选项 (移动已无通话流水功能)
+        if carrier != CARRIER_MOBILE:
+            try:
+                current_limit = int(
+                    self.target_entry.options.get(
+                        CONF_OVERVIEW_CALL_LIMIT, OVERVIEW_CALL_LIMIT_DEFAULT
+                    )
+                    or 0
+                )
+            except Exception:
+                current_limit = OVERVIEW_CALL_LIMIT_DEFAULT
+            schema_dict[
+                vol.Optional(CONF_OVERVIEW_CALL_LIMIT, default=current_limit)
+            ] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0,
+                    max=5000,
+                    step=1,
+                    unit_of_measurement="条",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
             )
-        )
 
         return self.async_show_form(
             step_id="init",

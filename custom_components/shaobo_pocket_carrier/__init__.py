@@ -14,19 +14,30 @@ from .const import (
     DOMAIN,
     CARRIER_TELECOM,
     CARRIER_UNICOM,
+    CARRIER_MOBILE,
     CONF_CARRIER,
     CONF_PHONE,
     CONF_AUTH_DATA,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_TELECOM,
     DEFAULT_SCAN_INTERVAL_UNICOM,
+    DEFAULT_SCAN_INTERVAL_MOBILE,
     EVENT_LOGIN_EXPIRED,
     MIN_SCAN_INTERVAL,
+    ENTITY_AUTO_QUERY_SWITCH,
+    ENTITY_AUTO_QUERY_TIME,
+    ENTITY_CALL_QUERY_DAILY_RESET,
+    ENTITY_CALL_QUERY_START_DATE,
 )
-from .coordinator import TelecomDataUpdateCoordinator, UnicomDataUpdateCoordinator
+from .coordinator import (
+    TelecomDataUpdateCoordinator,
+    UnicomDataUpdateCoordinator,
+    MobileDataUpdateCoordinator,
+)
 from .platforms.auto_query import async_cancel_daily_query, async_cancel_daily_reset
 from .platforms.telecom_login import async_setup_login_listener
-from .views import CarrierSliderPageView, CarrierSliderVerifyView
+from .platforms.mobile_login import async_setup_login_listener as async_setup_mobile_login_listener
+from .views import CarrierSliderPageView, CarrierSliderVerifyView, CarrierMobileTutorialView
 
 from .storage import async_remove_carrier_account, async_remove_call_record_cache
 
@@ -42,7 +53,7 @@ PLATFORMS = [
 ]
 
 URL_CARD = "/shaobo_pocket_carrier/pocket-carrier-card.js"
-VERSION_CARD = "5.11.9"
+VERSION_CARD = "5.11.15"
 # 早期内置的完整版 room-elves-card，文件已移除: 资源里残留的旧地址会 404，启动时一并清掉
 LEGACY_CARD_URLS = ("/shaobo_pocket_carrier/room-elves-card.js",)
 
@@ -99,11 +110,13 @@ async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> No
 
 def _effective_scan_interval(entry: ConfigEntry) -> int:
     """实际生效的轮询间隔 (分钟)，算法与协调器构造时一致: 选项里没有就取运营商默认值"""
-    default = (
-        DEFAULT_SCAN_INTERVAL_TELECOM
-        if entry.data.get(CONF_CARRIER) == CARRIER_TELECOM
-        else DEFAULT_SCAN_INTERVAL_UNICOM
-    )
+    carrier = entry.data.get(CONF_CARRIER)
+    if carrier == CARRIER_TELECOM:
+        default = DEFAULT_SCAN_INTERVAL_TELECOM
+    elif carrier == CARRIER_MOBILE:
+        default = DEFAULT_SCAN_INTERVAL_MOBILE
+    else:
+        default = DEFAULT_SCAN_INTERVAL_UNICOM
     try:
         interval = int(entry.options.get(CONF_SCAN_INTERVAL, default))
     except Exception:
@@ -188,6 +201,21 @@ def _async_remove_stale_telecom_device(hass: HomeAssistant, entry: ConfigEntry, 
         _LOGGER.info("已移除联通手机号 %s 下残留的电信空设备", phone)
 
 
+@callback
+def _async_cleanup_mobile_stale_entities(hass: HomeAssistant, entry: ConfigEntry, phone: str) -> None:
+    """自动清理移动条目下已无用处的通话记录类实体 (自动获取开关、时间、每日重置、查询日期等)"""
+    ent_reg = er.async_get(hass)
+    stale_keys = [
+        "auto_query",
+        "daily_reset",
+        "call_query",
+    ]
+    for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        if any(k in reg_entry.unique_id or k in reg_entry.entity_id for k in stale_keys):
+            _LOGGER.info("正在清理移动手机号 %s 下无用的通话记录实体: %s", phone, reg_entry.entity_id)
+            ent_reg.async_remove(reg_entry.entity_id)
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """初始化全局组件环境，注册前端卡片静态资源与联通方案一滑块服务视图"""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -213,6 +241,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     if not domain_data.get("views_registered"):
         hass.http.register_view(CarrierSliderPageView)
         hass.http.register_view(CarrierSliderVerifyView)
+        hass.http.register_view(CarrierMobileTutorialView)
         domain_data["views_registered"] = True
     return True
 
@@ -226,6 +255,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator = TelecomDataUpdateCoordinator(hass, phone, auth_data, entry=entry)
     elif carrier == CARRIER_UNICOM:
         coordinator = UnicomDataUpdateCoordinator(hass, phone, auth_data, entry=entry)
+    elif carrier == CARRIER_MOBILE:
+        coordinator = MobileDataUpdateCoordinator(hass, phone, auth_data, entry=entry)
     else:
         _LOGGER.error("未知的运营商类型: %s", carrier)
         return False
@@ -279,6 +310,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if carrier == CARRIER_UNICOM:
         await _async_migrate_unicom_control_entities(hass, entry, phone)
+
+    if carrier == CARRIER_MOBILE:
+        _async_cleanup_mobile_stale_entities(hass, entry, phone)
+        entry.async_on_unload(async_setup_mobile_login_listener(hass, entry, coordinator))
+        if getattr(coordinator, "login_expired", False):
+            _LOGGER.info("启动时检测到移动账号已离线，补发登录失效事件以触发自动登录")
+            hass.bus.async_fire(
+                EVENT_LOGIN_EXPIRED,
+                {
+                    "entry_id": entry.entry_id,
+                    "phone": phone,
+                    "reason": str(getattr(coordinator, "last_auth_error", "")),
+                },
+            )
 
     # 转发加载 传感器 / 文本 / 按钮 / 日期 / 开关 / 时间 平台
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

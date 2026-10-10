@@ -19,6 +19,7 @@ from ..const import (
     DOMAIN,
     CARRIER_NAMES,
     CARRIER_TELECOM,
+    CARRIER_MOBILE,
     CONF_CARRIER,
     ENTITY_ID_SUFFIXES,
     SENSOR_ONLINE,
@@ -115,10 +116,10 @@ class CarrierControlEntity(ForcedEntityIdMixin, Entity):
         self._removed = False
         self._attr_name = name
         self._attr_icon = icon
-        # 运营商以配置条目为准 (电信/联通共用控制类实体)，与传感器归到同一台设备下
-        carrier = carrier or entry.data.get(CONF_CARRIER) or CARRIER_TELECOM
-        self._attr_unique_id = f"{DOMAIN}_{carrier}_{phone}_{key}"
-        self._attr_device_info = build_device_info(carrier, phone)
+        # 运营商以配置条目为准 (电信/联通/移动共用控制类实体)，与传感器归到同一台设备下
+        self.carrier = carrier or entry.data.get(CONF_CARRIER) or CARRIER_TELECOM
+        self._attr_unique_id = f"{DOMAIN}_{self.carrier}_{phone}_{key}"
+        self._attr_device_info = build_device_info(self.carrier, phone)
         self._setup_forced_entity_id(platform_domain, phone, key)
 
     @property
@@ -164,8 +165,12 @@ def build_device_info(carrier: str, phone: str) -> DeviceInfo:
         name=f"{carrier_name} ({phone})",
         manufacturer="Shaobor",
         model=f"{carrier_name}通信账户",
-        sw_version="13.4" if carrier == CARRIER_TELECOM else "13.1",
-        configuration_url="https://appgologinsz.189.cn" if carrier == CARRIER_TELECOM else "https://m.client.10010.com",
+        sw_version="12.5" if carrier == CARRIER_MOBILE else ("13.4" if carrier == CARRIER_TELECOM else "13.1"),
+        configuration_url=(
+            "https://clientaccess.10086.cn"
+            if carrier == CARRIER_MOBILE
+            else ("https://appgologinsz.189.cn" if carrier == CARRIER_TELECOM else "https://m.client.10010.com")
+        ),
     )
 
 
@@ -201,6 +206,19 @@ class BaseCarrierSensor(ForcedEntityIdMixin, CoordinatorEntity, SensorEntity):
         await super().async_added_to_hass()
         # 已注册过的旧 ID (含运营商前缀) 迁移到固定 ID
         self._async_migrate_entity_id()
+
+    @property
+    def available(self) -> bool:
+        """恒可用: 只要协调器有数据(包括降级的上次缓存数据)就保持可用状态。
+
+        CoordinatorEntity 默认在 last_update_success=False 时返回 False，
+        会导致接口抖动/凭证失效时整批实体变 unavailable。
+        此处覆盖为: 有协调器且数据字典非空时即为可用 (即使是上次拉取的缓存)，
+        无数据时才标记不可用 (首次启动还没拉到数据的窗口期)。
+        """
+        if self.coordinator is None:
+            return False
+        return bool(self.coordinator.data)
 
     @property
     def data(self) -> Dict[str, Any]:

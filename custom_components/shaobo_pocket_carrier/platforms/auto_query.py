@@ -35,7 +35,9 @@ from homeassistant.helpers.restore_state import RestoreEntity
 
 from ..const import (
     AFTER_LOGIN_QUERY_DELAY,
+    CARRIER_TELECOM,
     CARRIER_UNICOM,
+    CARRIER_MOBILE,
     CONF_CARRIER,
     CONF_CALL_START_DATE,
     DAILY_RESET_START_DATE_TIME,
@@ -507,7 +509,7 @@ def create_auto_query_time(
 
 
 # ---------------------------------------------------------------- 自动登录开关
-class TelecomAutoLoginSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity):
+class CarrierAutoLoginSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity):
     """登录失效后自动短信登录开关 (switch.<手机号>_auto_login)"""
 
     _attr_device_class = SwitchDeviceClass.SWITCH
@@ -531,14 +533,16 @@ class TelecomAutoLoginSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity):
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
         runtime = self._runtime
+        carrier = getattr(self, "carrier", None) or (self.entry.data.get(CONF_CARRIER) if self.entry else "")
+        target_entity_name = "「通话详单验证码」" if carrier == CARRIER_TELECOM else "「短信登录验证码」"
         attrs: Dict[str, Any] = {
             "功能说明": (
-                "开启后检测到登录失效会自动下发登录验证码；手机端把验证码写入"
-                "「通话详单验证码」实体即自动完成登录"
+                f"开启后检测到登录失效会自动下发登录验证码；手机端把验证码写入"
+                f"{target_entity_name}实体即自动完成登录"
             ),
             "登录态": "已失效" if self.login_expired else "有效",
             "连续失败次数": runtime.login_failures,
-            "自动登录状态": "已暂停（连续失败达上限，请手动按下认证按钮）"
+            "自动登录状态": "已暂停（连续失败达上限，请手动按下登录/认证按钮）"
             if runtime.auto_login_paused
             else "正常",
         }
@@ -559,10 +563,17 @@ class TelecomAutoLoginSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity):
         # 启动时若已经处于登录失效状态 (登录失效事件早于本实体创建)，补一次自动登录
         if self._runtime.auto_login_enabled and self.login_expired:
             _LOGGER.info("启动时检测到登录已失效，自动短信登录立即接管 (%s)", self.phone)
-            self.hass.async_create_task(
-                async_auto_login(self.hass, self.entry, self._coordinator, self._runtime),
-                name=f"{DOMAIN}_auto_login_startup",
-            )
+            if self.carrier == CARRIER_MOBILE:
+                from .mobile_login import async_auto_login as async_mobile_auto_login
+                self.hass.async_create_task(
+                    async_mobile_auto_login(self.hass, self.entry, self._coordinator, self._runtime),
+                    name=f"{DOMAIN}_auto_login_startup",
+                )
+            else:
+                self.hass.async_create_task(
+                    async_auto_login(self.hass, self.entry, self._coordinator, self._runtime),
+                    name=f"{DOMAIN}_auto_login_startup",
+                )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._runtime.auto_login_enabled = True
@@ -577,14 +588,17 @@ class TelecomAutoLoginSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity):
         _LOGGER.info("自动短信登录已关闭 (%s)", self.phone)
 
 
+TelecomAutoLoginSwitch = CarrierAutoLoginSwitch
+
+
 def create_auto_login_switch(
     hass: HomeAssistant,
     coordinator,
     phone: str,
     entry: ConfigEntry,
-) -> TelecomAutoLoginSwitch:
-    """创建「自动短信登录」开关实体 (switch 平台)"""
-    return TelecomAutoLoginSwitch(hass, coordinator, phone, entry)
+) -> CarrierAutoLoginSwitch:
+    """创建「自动短信登录」开关实体 (switch 平台，支持电信与移动)"""
+    return CarrierAutoLoginSwitch(hass, coordinator, phone, entry)
 
 
 # ---------------------------------------------------------------- 每日重置查询起始日期
