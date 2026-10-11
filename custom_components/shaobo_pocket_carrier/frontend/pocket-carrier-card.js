@@ -11,6 +11,31 @@
  *   tel_1_name: 我的
  */
 
+// 全局链接监听: 确保所有点击抓包教程页面或滑块验证的链接始终强制在新标签页(New Tab)打开，防止冲掉当前配置弹窗
+if (typeof window !== "undefined" && !window._carrierLinkInterceptorBound) {
+  window._carrierLinkInterceptorBound = true;
+  window.addEventListener(
+    "click",
+    function (e) {
+      try {
+        const path = e.composedPath ? e.composedPath() : [];
+        const anchor = path.find((el) => el && el.tagName === "A");
+        if (
+          anchor &&
+          anchor.href &&
+          (anchor.href.includes("/api/shaobo_pocket_carrier/mobile_tutorial") ||
+            anchor.href.includes("/api/shaobo_pocket_carrier/slider"))
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          window.open(anchor.href, "_blank", "noopener,noreferrer");
+        }
+      } catch (err) {}
+    },
+    true
+  );
+}
+
 // EChartsMixin
 const bt = {
   _preloadEcharts() {

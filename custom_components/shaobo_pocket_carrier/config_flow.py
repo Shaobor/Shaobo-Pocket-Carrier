@@ -188,11 +188,15 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             pass
 
         if req_host:
-            target_host = req_host
-        else:
-            target_host = "localhost:8123"
+            if "127.0.0.1" in req_host:
+                target_host = req_host.replace("127.0.0.1", "localhost")
+            elif "localhost" in req_host:
+                target_host = req_host.replace("localhost", "127.0.0.1")
+            else:
+                target_host = req_host
+            return f"{req_scheme}://{target_host}/api/shaobo_pocket_carrier/mobile_tutorial"
 
-        return f"{req_scheme}://{target_host}/api/shaobo_pocket_carrier/mobile_tutorial"
+        return "/api/shaobo_pocket_carrier/mobile_tutorial"
 
     _get_tutorial_url = _get_mobile_tutorial_url
 
