@@ -563,17 +563,10 @@ class CarrierAutoLoginSwitch(CarrierControlEntity, SwitchEntity, RestoreEntity):
         # 启动时若已经处于登录失效状态 (登录失效事件早于本实体创建)，补一次自动登录
         if self._runtime.auto_login_enabled and self.login_expired:
             _LOGGER.info("启动时检测到登录已失效，自动短信登录立即接管 (%s)", self.phone)
-            if self.carrier == CARRIER_MOBILE:
-                from .mobile_login import async_auto_login as async_mobile_auto_login
-                self.hass.async_create_task(
-                    async_mobile_auto_login(self.hass, self.entry, self._coordinator, self._runtime),
-                    name=f"{DOMAIN}_auto_login_startup",
-                )
-            else:
-                self.hass.async_create_task(
-                    async_auto_login(self.hass, self.entry, self._coordinator, self._runtime),
-                    name=f"{DOMAIN}_auto_login_startup",
-                )
+            self.hass.async_create_task(
+                async_auto_login(self.hass, self.entry, self._coordinator, self._runtime),
+                name=f"{DOMAIN}_auto_login_startup",
+            )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._runtime.auto_login_enabled = True

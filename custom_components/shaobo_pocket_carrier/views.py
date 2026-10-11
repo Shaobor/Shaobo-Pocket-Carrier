@@ -269,6 +269,14 @@ MOBILE_TUTORIAL_HTML = """<!DOCTYPE html>
             --primary: #0284c7;
             --accent: #10b981;
             --code-bg: rgba(15, 23, 42, 0.8);
+            --danger-bg: rgba(239, 68, 68, 0.12);
+            --danger-border: #ef4444;
+            --danger-title: #f87171;
+            --danger-text: #f1f5f9;
+            --danger-strong: #fca5a5;
+            --step-tip-bg: rgba(239, 68, 68, 0.12);
+            --step-tip-border: #ef4444;
+            --step-tip-text: #f1f5f9;
         }
         @media (prefers-color-scheme: light) {
             :root {
@@ -280,6 +288,14 @@ MOBILE_TUTORIAL_HTML = """<!DOCTYPE html>
                 --primary: #0284c7;
                 --accent: #059669;
                 --code-bg: #e2e8f0;
+                --danger-bg: #fff1f2;
+                --danger-border: #f43f5e;
+                --danger-title: #be123c;
+                --danger-text: #1e293b;
+                --danger-strong: #b91c1c;
+                --step-tip-bg: #fff1f2;
+                --step-tip-border: #e11d48;
+                --step-tip-text: #1e293b;
             }
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -410,6 +426,50 @@ MOBILE_TUTORIAL_HTML = """<!DOCTYPE html>
             color: #f59e0b;
             font-weight: 600;
         }
+        .danger-card {
+            background: var(--danger-bg);
+            border: 2px solid var(--danger-border);
+            border-radius: 12px;
+            padding: 16px;
+            margin-top: 14px;
+            margin-bottom: 18px;
+            font-size: 13.5px;
+            color: var(--danger-text);
+            line-height: 1.6;
+            box-shadow: 0 4px 20px rgba(239, 68, 68, 0.12);
+        }
+        .danger-title {
+            color: var(--danger-title);
+            font-weight: 800;
+            font-size: 15px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .text-red {
+            color: var(--danger-strong);
+            font-weight: 700;
+        }
+        .danger-tag {
+            background: #ef4444;
+            color: #ffffff;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 700;
+            margin-right: 6px;
+        }
+        .step-danger-tip {
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: var(--step-tip-bg);
+            border-left: 3.5px solid var(--step-tip-border);
+            border-radius: 6px;
+            color: var(--step-tip-text);
+            font-size: 12px;
+            line-height: 1.5;
+        }
         .faq-card {
             background: rgba(16, 185, 129, 0.08);
             border: 1px solid rgba(16, 185, 129, 0.25);
@@ -480,6 +540,19 @@ MOBILE_TUTORIAL_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- 红色醒目警示框 -->
+        <div class="danger-card">
+            <div class="danger-title">🚨 核心防掉线警示（防会话顶号必读）</div>
+            <div style="margin-bottom: 8px;">
+                <span class="danger-tag">红色重点</span><b class="text-red">抓包填入 Home Assistant 后，切勿在手机上再次打开中国移动 App！</b>
+            </div>
+            <div>
+                • <b class="text-red">为什么会掉线/离线？</b> 中国移动服务端采用严格的<b>单设备最新会话互斥策略</b>。当您在手机上重新打开、冷启动或前台唤醒中国移动 App 时，App 底层会在毫秒级向服务器换签全新的 Session 并<b>强制注销踢掉旧凭据</b>，这会当场使填入 Home Assistant 的 Cookie 失效！<br>
+                • <b class="text-red">稳定保活秘诀：</b> 抓包完成后请彻底划掉/退出手机上的移动 App。只要手机端<b>不再主动打开该 App</b>，Home Assistant 即可在后台<b>长期稳定保活</b>（实测已彻底打破 30 分钟硬限制，可持续保活数周以上）；<br>
+                • <b class="text-red">强烈推荐方案：</b> 建议使用<b>备用机或电脑安卓模拟器</b>抓包供 Home Assistant 专用，主力机即可随意使用移动 App 而互不干扰。
+            </div>
+        </div>
+
         <div class="step-list">
             <!-- 步骤 1 -->
             <div class="step-item">
@@ -502,6 +575,9 @@ MOBILE_TUTORIAL_HTML = """<!DOCTYPE html>
                 </div>
                 <div class="step-desc">
                     打开<b>“中国移动”官方 App</b>，在首页下拉刷新，或者点击底部导航栏的<b>“我的”</b>页面，直到屏幕上展示出当前话费和剩余流量。
+                    <div class="step-danger-tip">
+                        🔴 <b class="text-red">关键注意：</b>抓包成功并获取到 cURL 后，请<b>立即划掉退出手机上的移动 App</b>！后续切勿随意再次打开，否则 App 会签发新凭据而导致 HA 凭据失效。
+                    </div>
                 </div>
             </div>
 
@@ -545,14 +621,19 @@ MOBILE_TUTORIAL_HTML = """<!DOCTYPE html>
                 </div>
                 <div class="step-desc">
                     回到 Home Assistant 集成配置页面，将复制的整段内容完整粘贴至<b>“移动抓包凭据”</b>输入框中，系统会自动智能提取有效凭据并直接完成绑定！
+                    <div class="step-danger-tip">
+                        🚫 <b class="text-red">禁止操作：</b>提交成功后请直接在 HA 中查看卡片，<b>千万不要返回手机打开移动 App 验证</b>，否则刚绑定的凭据会被当场顶掉！
+                    </div>
                 </div>
             </div>
         </div>
 
         <div class="faq-card">
-            <div class="faq-title">💡 常见问题与提示</div>
-            <p>• <b>凭据能用多久？</b> 提取的会话凭证通常可持续保活数周至数月，日常无需频繁抓包；</p>
-            <p style="margin-top: 4px;">• <b>失效了怎么办？</b> 如果未来收到凭据过期通知，只需按同样步骤重新复制一次即可恢复。</p>
+            <div class="faq-title">💡 常见问题与排查</div>
+            <p>• <b class="text-red">为什么配置完没多久就提示重新登录/离线？</b><br>
+            <span style="display:inline-block; margin-left: 14px; margin-top: 2px;"><b>99% 的原因是在抓包后手机端又打开了移动 App</b>。手机 App 启动会自动换发新票据，导致服务端单点注销了 HA 的旧凭据。只要关闭手机端 App，或使用备用机抓包，即可长期稳定运行。</span></p>
+            <p style="margin-top: 6px;">• <b>凭据正常能用多久？</b> 只要手机端不主动打开移动 App 顶号，提取的会话凭据可在后台稳定轮询数周乃至更久；</p>
+            <p style="margin-top: 4px;">• <b>失效了怎么办？</b> 如果未来收到凭据过期通知，只需按本教程重新抓包复制一次即可恢复。</p>
         </div>
 
         <div class="footer-action">

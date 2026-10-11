@@ -28,10 +28,6 @@ from .auto_query import (
     create_auto_query_time,
     create_daily_reset_switch,
 )
-from .mobile_auth import (
-    create_mobile_auth_button_entity,
-    create_mobile_auth_text_entity,
-)
 from .mobile_sensor import get_mobile_sensors
 from .overview import create_overview_sensor
 from .region_db import create_region_auto_switch, create_region_update_button
@@ -101,7 +97,7 @@ async def async_setup_carrier_texts(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """文本平台: 电信通话详单二次认证参数 (姓名/身份证号/验证码); 移动短信登录验证码"""
+    """文本平台: 电信通话详单二次认证参数 (姓名/身份证号/验证码)；移动目前采用 Cookie 接入无需文本实体"""
     context = get_carrier_context(hass, entry)
     if context is None:
         return
@@ -113,12 +109,6 @@ async def async_setup_carrier_texts(
             create_call_auth_text_entities(hass, coordinator, phone, entry),
             update_before_add=False,
         )
-    elif carrier == CARRIER_MOBILE:
-        _LOGGER.debug("正在为移动手机号 %s 注册短信登录验证码实体", phone)
-        async_add_entities(
-            [create_mobile_auth_text_entity(hass, coordinator, phone, entry)],
-            update_before_add=False,
-        )
 
 
 async def async_setup_carrier_buttons(
@@ -126,7 +116,7 @@ async def async_setup_carrier_buttons(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """按钮平台: 归属地库更新按钮通用; 电信: 通话详单二次认证按钮; 联通: 刷新详单流水按钮; 移动: 短信登录按钮"""
+    """按钮平台: 归属地库更新按钮通用; 电信: 通话详单二次认证按钮; 联通: 刷新详单流水按钮"""
     context = get_carrier_context(hass, entry)
     if context is None:
         return
@@ -137,8 +127,6 @@ async def async_setup_carrier_buttons(
         buttons.append(create_call_auth_button_entity(hass, coordinator, phone, entry))
     elif carrier == CARRIER_UNICOM:
         buttons.append(create_detail_refresh_button(hass, coordinator, phone, entry))
-    elif carrier == CARRIER_MOBILE:
-        buttons.append(create_mobile_auth_button_entity(hass, coordinator, phone, entry))
 
     _LOGGER.debug("正在为 %s 手机号 %s 注册按钮实体 (共 %d 个)", carrier, phone, len(buttons))
     async_add_entities(buttons, update_before_add=False)
@@ -171,17 +159,16 @@ async def async_setup_carrier_switches(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """开关平台: 自动获取通话记录 / 每日重置查询起始日期 / 自动更新归属地库 (通用); 自动短信登录 (电信与移动)"""
+    """开关平台: 自动获取通话记录 / 每日重置查询起始日期 / 自动更新归属地库 (通用); 自动短信登录 (电信)"""
     context = get_carrier_context(hass, entry)
     if context is None:
         return
     coordinator, carrier, phone = context
 
-    # 中国移动已移除通话记录功能，注册归属地自动更新开关和自动短信登录开关
+    # 中国移动目前仅需归属地自动更新开关，无需通话记录与自动短信登录开关
     if carrier == CARRIER_MOBILE:
         switches = [
             create_region_auto_switch(hass, coordinator, phone, entry),
-            create_auto_login_switch(hass, coordinator, phone, entry),
         ]
         _LOGGER.debug("正在为移动手机号 %s 注册开关实体 (共 %d 个)", phone, len(switches))
         async_add_entities(switches, update_before_add=False)

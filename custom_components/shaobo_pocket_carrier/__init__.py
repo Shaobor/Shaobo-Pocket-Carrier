@@ -36,7 +36,6 @@ from .coordinator import (
 )
 from .platforms.auto_query import async_cancel_daily_query, async_cancel_daily_reset
 from .platforms.telecom_login import async_setup_login_listener
-from .platforms.mobile_login import async_setup_login_listener as async_setup_mobile_login_listener
 from .views import CarrierSliderPageView, CarrierSliderVerifyView, CarrierMobileTutorialView
 
 from .storage import async_remove_carrier_account, async_remove_call_record_cache
@@ -53,7 +52,7 @@ PLATFORMS = [
 ]
 
 URL_CARD = "/shaobo_pocket_carrier/pocket-carrier-card.js"
-VERSION_CARD = "5.11.16"
+VERSION_CARD = "5.11.17"
 # 早期内置的完整版 room-elves-card，文件已移除: 资源里残留的旧地址会 404，启动时一并清掉
 LEGACY_CARD_URLS = ("/shaobo_pocket_carrier/room-elves-card.js",)
 
@@ -203,16 +202,21 @@ def _async_remove_stale_telecom_device(hass: HomeAssistant, entry: ConfigEntry, 
 
 @callback
 def _async_cleanup_mobile_stale_entities(hass: HomeAssistant, entry: ConfigEntry, phone: str) -> None:
-    """自动清理移动条目下已无用处的通话记录类实体 (自动获取开关、时间、每日重置、查询日期等)"""
+    """自动清理移动条目下已无用处的实体 (通话记录类、短信验证码、短信登录按钮、自动登录开关等)"""
     ent_reg = er.async_get(hass)
     stale_keys = [
         "auto_query",
         "daily_reset",
         "call_query",
+        "call_auth_code",
+        "_code",
+        "login_button",
+        "auto_login",
+        "mobile_auth",
     ]
     for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
         if any(k in reg_entry.unique_id or k in reg_entry.entity_id for k in stale_keys):
-            _LOGGER.info("正在清理移动手机号 %s 下无用的通话记录实体: %s", phone, reg_entry.entity_id)
+            _LOGGER.info("正在清理移动手机号 %s 下无用的废弃实体: %s", phone, reg_entry.entity_id)
             ent_reg.async_remove(reg_entry.entity_id)
 
 
@@ -313,17 +317,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if carrier == CARRIER_MOBILE:
         _async_cleanup_mobile_stale_entities(hass, entry, phone)
-        entry.async_on_unload(async_setup_mobile_login_listener(hass, entry, coordinator))
-        if getattr(coordinator, "login_expired", False):
-            _LOGGER.info("启动时检测到移动账号已离线，补发登录失效事件以触发自动登录")
-            hass.bus.async_fire(
-                EVENT_LOGIN_EXPIRED,
-                {
-                    "entry_id": entry.entry_id,
-                    "phone": phone,
-                    "reason": str(getattr(coordinator, "last_auth_error", "")),
-                },
-            )
 
     # 转发加载 传感器 / 文本 / 按钮 / 日期 / 开关 / 时间 平台
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

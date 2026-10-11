@@ -881,33 +881,6 @@ class MobileDataUpdateCoordinator(DataUpdateCoordinator):
             # 首次拉取就失败: 没有上次数据，返回空字典让实体显示初始默认值
             return {}
 
-    async def async_send_login_sms(self) -> tuple[bool, str]:
-        """下发中国移动登录短信验证码"""
-        try:
-            async with self._client_lock:
-                ok, msg = await self.hass.async_add_executor_job(self.client.send_sms)
-        except Exception as err:
-            _LOGGER.warning("移动手机号 %s 下发登录验证码异常: %s", self.phone, err)
-            return False, f"请求异常 ({err})"
-
-        if ok:
-            _LOGGER.info("移动手机号 %s 登录验证码短信已下发: %s", self.phone, msg)
-            return True, msg or "登录验证码短信已下发"
-        return False, msg or "短信下发失败，请稍后重试"
-
-    async def async_login_with_sms(self, code: str) -> tuple[bool, str]:
-        """用短信验证码完成移动绑定登录 (成功时 client 内部已装载新 Cookie)"""
-        try:
-            async with self._client_lock:
-                ok, msg = await self.hass.async_add_executor_job(self.client.login_with_sms, code)
-        except Exception as err:
-            _LOGGER.warning("移动手机号 %s 短信登录异常: %s", self.phone, err)
-            return False, f"请求异常 ({err})"
-
-        if ok:
-            return True, "登录成功"
-        return False, msg or "验证码错误或已过期"
-
     async def async_probe_login_state(self) -> str:
         """主动探活中国移动登录态
 

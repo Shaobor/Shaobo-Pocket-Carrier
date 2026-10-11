@@ -55,7 +55,6 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.phone: str = ""
         self.telecom_client: Optional[TelecomClient] = None
         self.unicom_client: Optional[UnicomClient] = None
-        self.mobile_client: Optional[MobileClient] = None
 
     async def async_step_user(self, user_input=None):
         """步骤1: 下拉选择运营商网络"""
@@ -165,7 +164,7 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    def _get_tutorial_url(self) -> str:
+    def _get_mobile_tutorial_url(self) -> str:
         """获取中国移动抓包教程在新窗口打开的跨源/外部访问 URL"""
         domain_data = self.hass.data.setdefault(DOMAIN, {})
         if not domain_data.get("views_registered"):
@@ -199,33 +198,69 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return f"{req_scheme}://{target_host}/api/shaobo_pocket_carrier/mobile_tutorial"
 
+    _get_tutorial_url = _get_mobile_tutorial_url
+
     async def async_step_mobile(self, user_input=None):
-        """步骤2 (移动): 输入手机号码并发送短信验证码"""
+        """步骤2 (移动 12.5): 输入手机号码及抓包凭据 (Cookie / cURL / 原始文本)"""
         self.carrier = CARRIER_MOBILE
         errors = {}
-        description_placeholders = {}
+        description_placeholders = {
+            "tutorial_url": self._get_mobile_tutorial_url(),
+        }
 
         if user_input is not None:
-            self.phone = user_input[CONF_PHONE].strip()
+            self.phone = user_input.get(CONF_PHONE, "").strip()
+            raw_cookie = user_input.get("cookie", "").strip()
+
             if len(self.phone) != 11 or not self.phone.isdigit():
                 errors["base"] = "invalid_phone"
             else:
-                unique_id = f"{self.carrier}_{self.phone}"
-                await self.async_set_unique_id(unique_id, raise_on_progress=False)
-                self._abort_if_unique_id_configured()
-
-                self.mobile_client = await self.hass.async_add_executor_job(MobileClient, self.phone)
-                ok, msg = await self.hass.async_add_executor_job(self.mobile_client.send_sms)
-                if ok:
-                    return await self.async_step_mobile_sms()
+                auth_data = parse_mobile_auth_data(raw_cookie)
+                cookies_dict = auth_data.get("cookies") or {}
+                if not cookies_dict or not any(k in cookies_dict for k in ("JSESSIONID", "UID", "ticketID")):
+                    errors["base"] = "invalid_cookie"
                 else:
-                    _LOGGER.warning("移动手机号 %s 发送验证码失败: %s", self.phone, msg)
-                    errors["base"] = "carrier_api_error"
-                    description_placeholders["error_detail"] = msg or "短信下发未成功，请稍后再试"
+                    unique_id = f"{self.carrier}_{self.phone}"
+                    await self.async_set_unique_id(unique_id, raise_on_progress=False)
+                    self._abort_if_unique_id_configured()
+
+                    test_client = MobileClient(self.phone, auth_data)
+                    try:
+                        # 尝试调用原生接口拉取数据进行连通性与凭据有效性校验
+                        await self.hass.async_add_executor_job(test_client.fetch_all_data)
+                    except CarrierAuthExpiredError as auth_err:
+                        _LOGGER.warning("移动凭据校验失败: %s", auth_err)
+                        errors["base"] = "mobile_auth_failed"
+                    except Exception as err:
+                        _LOGGER.warning("移动接口连通性测试网络异常 (仍尝试保存): %s", err)
+
+                    if not errors:
+                        latest_auth = test_client.export_auth()
+                        await async_save_carrier_account(self.hass, CARRIER_MOBILE, self.phone, latest_auth)
+
+                        if hasattr(self, "_reauth_entry") and self._reauth_entry:
+                            return self.async_update_reload_and_abort(
+                                self._reauth_entry,
+                                data_updates={
+                                    CONF_AUTH_DATA: latest_auth,
+                                },
+                            )
+
+                        return self.async_create_entry(
+                            title=f"中国移动 ({self.phone})",
+                            data={
+                                CONF_CARRIER: CARRIER_MOBILE,
+                                CONF_PHONE: self.phone,
+                                CONF_AUTH_DATA: latest_auth,
+                            },
+                        )
 
         schema = vol.Schema({
             vol.Required(CONF_PHONE): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.TEL)
+            ),
+            vol.Required("cookie"): selector.TextSelector(
+                selector.TextSelectorConfig(multiline=True)
             ),
         })
         return self.async_show_form(
@@ -235,56 +270,6 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders=description_placeholders,
         )
 
-    async def async_step_mobile_sms(self, user_input=None):
-        """步骤3 (移动): 输入 6 位短信验证码完成绑定"""
-        errors = {}
-        description_placeholders = {}
-
-        if user_input is not None:
-            sms_code = user_input.get("sms_code", "").strip()
-            if not self.mobile_client:
-                errors["base"] = "unknown"
-            else:
-                ok, msg = await self.hass.async_add_executor_job(self.mobile_client.login_with_sms, sms_code)
-                if ok:
-                    auth_data = self.mobile_client.export_auth()
-                    await async_save_carrier_account(self.hass, CARRIER_MOBILE, self.phone, auth_data)
-
-                    if hasattr(self, "_reauth_entry") and self._reauth_entry:
-                        return self.async_update_reload_and_abort(
-                            self._reauth_entry,
-                            data_updates={
-                                CONF_AUTH_DATA: auth_data,
-                            },
-                        )
-
-                    return self.async_create_entry(
-                        title=f"中国移动 ({self.phone})",
-                        data={
-                            CONF_CARRIER: CARRIER_MOBILE,
-                            CONF_PHONE: self.phone,
-                            CONF_AUTH_DATA: auth_data,
-                        },
-                    )
-                else:
-                    _LOGGER.warning("移动手机号 %s 短信验证码登录失败: %s", self.phone, msg)
-                    errors["base"] = "carrier_api_error"
-                    description_placeholders["error_detail"] = msg or "短信验证码错误或已失效"
-
-        schema = vol.Schema({
-            vol.Required("sms_code"): selector.TextSelector(
-                selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
-            ),
-        })
-
-        desc_placeholders = {"phone": self.phone}
-        desc_placeholders.update(description_placeholders)
-        return self.async_show_form(
-            step_id="mobile_sms",
-            data_schema=schema,
-            errors=errors,
-            description_placeholders=desc_placeholders,
-        )
 
     async def async_step_telecom_sms(self, user_input=None):
         """步骤2 (电信): 输入 6 位短信验证码"""
@@ -416,59 +401,6 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-    async def async_step_mobile_cookie(self, user_input=None):
-        """步骤2 (移动): 输入抓包 Cookie / 凭据"""
-        errors = {}
-        if user_input is not None:
-            raw_cookie = user_input.get("cookie", "").strip()
-            auth_data = parse_mobile_auth_data(raw_cookie)
-            if not auth_data.get("cookie") and not auth_data.get("xk"):
-                errors["base"] = "invalid_cookie"
-            else:
-                # 尝试连通性校验
-                test_client = MobileClient(self.phone, auth_data)
-                try:
-                    await self.hass.async_add_executor_job(test_client.fetch_all_data)
-                except CarrierAuthExpiredError as auth_err:
-                    _LOGGER.warning("移动凭据验证失败: %s", auth_err)
-                    errors["base"] = "mobile_auth_failed"
-                except Exception as err:
-                    _LOGGER.warning("移动接口连通性测试异常(仍尝试保存): %s", err)
-
-                if not errors:
-                    await async_save_carrier_account(self.hass, CARRIER_MOBILE, self.phone, auth_data)
-                    if hasattr(self, "_reauth_entry") and self._reauth_entry:
-                        return self.async_update_reload_and_abort(
-                            self._reauth_entry,
-                            data_updates={
-                                CONF_AUTH_DATA: auth_data,
-                            },
-                        )
-
-                    return self.async_create_entry(
-                        title=f"中国移动 ({self.phone})",
-                        data={
-                            CONF_CARRIER: CARRIER_MOBILE,
-                            CONF_PHONE: self.phone,
-                            CONF_AUTH_DATA: auth_data,
-                        },
-                    )
-
-        schema = vol.Schema({
-            vol.Required("cookie"): selector.TextSelector(
-                selector.TextSelectorConfig(multiline=True)
-            )
-        })
-        return self.async_show_form(
-            step_id="mobile_cookie",
-            data_schema=schema,
-            errors=errors,
-            description_placeholders={
-                "phone": self.phone,
-                "tutorial_url": self._get_tutorial_url(),
-            },
-        )
-
     async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> config_entries.ConfigFlowResult:
         """步骤 Reauth: 处理 Home Assistant 官方触发的重新认证"""
         self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
@@ -481,23 +413,7 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
         if user_input is not None:
             if self.carrier == CARRIER_MOBILE:
-                self.mobile_client = MobileClient(self.phone)
-                domain_data = self.hass.data.setdefault(DOMAIN, {})
-                if not domain_data.get("views_registered"):
-                    self.hass.http.register_view(CarrierSliderPageView())
-                    self.hass.http.register_view(CarrierSliderVerifyView())
-                    domain_data["views_registered"] = True
-                ok, msg = await self.hass.async_add_executor_job(self.mobile_client.send_sms)
-                if ok:
-                    return await self.async_step_mobile_sms()
-                else:
-                    SLIDER_SESSIONS[self.flow_id] = {
-                        "carrier": CARRIER_MOBILE,
-                        "client": self.mobile_client,
-                        "phone": self.phone,
-                        "status": "pending",
-                    }
-                    return await self.async_step_mobile_slider()
+                return await self.async_step_reauth_mobile()
             elif self.carrier == CARRIER_UNICOM:
                 self.unicom_client = UnicomClient(self.phone)
                 SLIDER_SESSIONS[self.flow_id] = self.unicom_client
@@ -528,6 +444,53 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "carrier": carrier_name,
                 "phone": self.phone,
             },
+        )
+
+    async def async_step_reauth_mobile(self, user_input=None) -> config_entries.ConfigFlowResult:
+        """步骤 Reauth (移动 12.5): 凭据过期时重新粘贴 Cookie"""
+        errors = {}
+        description_placeholders = {
+            "phone": self.phone,
+            "tutorial_url": self._get_mobile_tutorial_url(),
+        }
+
+        if user_input is not None:
+            raw_cookie = user_input.get("cookie", "").strip()
+            auth_data = parse_mobile_auth_data(raw_cookie)
+            cookies_dict = auth_data.get("cookies") or {}
+            if not cookies_dict or not any(k in cookies_dict for k in ("JSESSIONID", "UID", "ticketID")):
+                errors["base"] = "invalid_cookie"
+            else:
+                test_client = MobileClient(self.phone, auth_data)
+                try:
+                    await self.hass.async_add_executor_job(test_client.fetch_all_data)
+                except CarrierAuthExpiredError as auth_err:
+                    _LOGGER.warning("移动重新认证凭据校验失败: %s", auth_err)
+                    errors["base"] = "mobile_auth_failed"
+                except Exception as err:
+                    _LOGGER.warning("移动重新认证网络测试异常 (仍保存): %s", err)
+
+                if not errors:
+                    latest_auth = test_client.export_auth()
+                    await async_save_carrier_account(self.hass, CARRIER_MOBILE, self.phone, latest_auth)
+                    if hasattr(self, "_reauth_entry") and self._reauth_entry:
+                        return self.async_update_reload_and_abort(
+                            self._reauth_entry,
+                            data_updates={
+                                CONF_AUTH_DATA: latest_auth,
+                            },
+                        )
+
+        schema = vol.Schema({
+            vol.Required("cookie"): selector.TextSelector(
+                selector.TextSelectorConfig(multiline=True)
+            )
+        })
+        return self.async_show_form(
+            step_id="reauth_mobile",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders=description_placeholders,
         )
 
     @classmethod
@@ -598,6 +561,35 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                     # 到了新月份 (如10月1日、11月1日) 将完全自动无缝切换，无需用户重复设置
                     if not selected_date or selected_date == today_first:
                         user_input[CONF_CALL_START_DATE] = ""
+
+            # 中国移动支持随时在选项中粘贴更新 Cookie
+            if carrier == CARRIER_MOBILE and user_input.get("update_cookie"):
+                raw_cookie = str(user_input.pop("update_cookie", "") or "").strip()
+                if raw_cookie:
+                    new_auth = parse_mobile_auth_data(raw_cookie)
+                    cookies_dict = new_auth.get("cookies") or {}
+                    if not cookies_dict or not any(k in cookies_dict for k in ("JSESSIONID", "UID", "ticketID")):
+                        errors["base"] = "invalid_cookie"
+                    else:
+                        phone = self.target_entry.data.get(CONF_PHONE, "")
+                        test_client = MobileClient(phone, new_auth)
+                        try:
+                            await self.hass.async_add_executor_job(test_client.fetch_all_data)
+                        except CarrierAuthExpiredError as auth_err:
+                            _LOGGER.warning("选项流更新移动凭据校验失败: %s", auth_err)
+                            errors["base"] = "mobile_auth_failed"
+                        except Exception as err:
+                            _LOGGER.warning("选项流更新移动凭据网络异常 (仍尝试保存): %s", err)
+
+                        if not errors:
+                            latest_auth = test_client.export_auth()
+                            updated_data = dict(self.target_entry.data)
+                            updated_data[CONF_AUTH_DATA] = latest_auth
+                            self.hass.config_entries.async_update_entry(self.target_entry, data=updated_data)
+                            await async_save_carrier_account(self.hass, CARRIER_MOBILE, phone, latest_auth)
+                            need_reload = True
+            elif "update_cookie" in user_input:
+                user_input.pop("update_cookie", None)
 
             if not errors:
                 new_options = dict(self.target_entry.options)
@@ -695,6 +687,13 @@ class CarrierOptionsFlowHandler(config_entries.OptionsFlow):
                     mode=selector.NumberSelectorMode.BOX,
                 )
             )
+            # 中国移动支持随时更新 Cookie
+            schema_dict[
+                vol.Optional("update_cookie")
+            ] = selector.TextSelector(
+                selector.TextSelectorConfig(multiline=True)
+            )
+
 
         # 仅电信和联通显示通话流水条数限制选项 (移动已无通话流水功能)
         if carrier != CARRIER_MOBILE:
