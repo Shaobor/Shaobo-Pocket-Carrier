@@ -187,11 +187,7 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception:
             pass
 
-        if "127.0.0.1" in req_host:
-            target_host = req_host.replace("127.0.0.1", "localhost")
-        elif "localhost" in req_host:
-            target_host = req_host.replace("localhost", "127.0.0.1")
-        elif req_host:
+        if req_host:
             target_host = req_host
         else:
             target_host = "localhost:8123"
