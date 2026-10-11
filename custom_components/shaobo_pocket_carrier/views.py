@@ -96,12 +96,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <iframe id="riskFrame" src="https://img.client.10010.com/loginRisk/index.html"></iframe>
         </div>
         
+        <div style="text-align:center;margin-top:6px;">
+            <a href="javascript:void(0)" onclick="closeOrBack()" style="color:rgba(255,255,255,0.6);font-size:12px;text-decoration:none;">🔙 若未在新标签页打开，点此返回 Home Assistant</a>
+        </div>
+
         <div id="statusBox" class="status-box"></div>
     </div>
 
     <script>
         const flowId = "__FLOW_ID__";
         const mobileHex = "__MOBILE_HEX__";
+
+        function closeOrBack() {
+            try {
+                window.opener = null;
+                window.open('', '_self');
+                window.close();
+            } catch(e) {}
+            setTimeout(function() {
+                if (!window.closed && history.length > 1) {
+                    history.back();
+                }
+            }, 300);
+        }
 
         function showStatus(text, isError) {
             const box = document.getElementById("statusBox");
@@ -141,7 +158,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 .then(r => r.json())
                 .then(res => {
                     if (res.success) {
-                        showStatus("✅ <b>滑块验证成功！短信已下发</b><br><span style='font-size:13px;opacity:0.85;display:inline-block;margin-top:6px;'>页面将在 <span id='countdown' style='font-weight:bold;color:#10b981;'>2</span> 秒后自动关闭，请切回 Home Assistant 输入短信验证码。<br><button onclick='window.close()' style='margin-top:10px;padding:6px 14px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer;'>立即关闭窗口</button></span>", false);
+                        showStatus("✅ <b>滑块验证成功！短信已下发</b><br><span style='font-size:13px;opacity:0.85;display:inline-block;margin-top:6px;'>页面将在 <span id='countdown' style='font-weight:bold;color:#10b981;'>2</span> 秒后自动关闭，请切回 Home Assistant 输入短信验证码。<br><button onclick='closeOrBack()' style='margin-top:10px;padding:6px 14px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:bold;'>立即返回 Home Assistant</button></span>", false);
                         let timeLeft = 2;
                         const timer = setInterval(function() {
                             timeLeft--;
@@ -149,11 +166,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             if (cd) cd.innerText = timeLeft;
                             if (timeLeft <= 0) {
                                 clearInterval(timer);
-                                try {
-                                    window.opener = null;
-                                    window.open('', '_self');
-                                    window.close();
-                                } catch(e) {}
+                                closeOrBack();
                             }
                         }, 1000);
                     } else {
@@ -637,13 +650,26 @@ MOBILE_TUTORIAL_HTML = """<!DOCTYPE html>
         </div>
 
         <div class="footer-action">
-            <button class="btn-main" onclick="window.close()">已掌握方法，关闭此教程窗口</button>
+            <button class="btn-main" onclick="closeOrBack()">已掌握方法，关闭此窗口并返回</button>
         </div>
     </div>
 
     <div class="toast" id="toast">已复制到剪贴板</div>
 
     <script>
+        function closeOrBack() {
+            try {
+                window.opener = null;
+                window.open('', '_self');
+                window.close();
+            } catch(e) {}
+            setTimeout(function() {
+                if (!window.closed && history.length > 1) {
+                    history.back();
+                }
+            }, 300);
+        }
+
         function copyText(txt) {
             navigator.clipboard.writeText(txt).then(() => {
                 const toast = document.getElementById('toast');

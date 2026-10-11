@@ -240,6 +240,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     card_url = f"{URL_CARD}?v={VERSION_CARD}"
     await _async_register_lovelace_resource(hass, card_url)
 
+    # 注册全局辅助前端脚本: 确保在任何页面(配置弹窗、集成页面)中点击抓包教程或滑块验证均在新标签页打开
+    try:
+        from homeassistant.components.frontend import add_extra_js_url
+        helper_url = f"/shaobo_pocket_carrier/carrier-helper.js?v={VERSION_CARD}"
+        add_extra_js_url(hass, helper_url)
+    except Exception as err:
+        _LOGGER.debug("注册全局 extra_js_url 失败(可忽略): %s", err)
+
     # 配置流在集成尚未 async_setup 时可能已抢先注册过同名视图，
     # 重复注册会命中 aiohttp 的重复路由保护，因此两处都要检查标记
     if not domain_data.get("views_registered"):

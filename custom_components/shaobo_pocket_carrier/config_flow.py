@@ -322,6 +322,40 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={"phone": self.phone},
         )
 
+    def _get_unicom_slider_url(self) -> str:
+        """获取中国联通滑块验证在新窗口打开的访问 URL"""
+        domain_data = self.hass.data.setdefault(DOMAIN, {})
+        if not domain_data.get("views_registered"):
+            try:
+                self.hass.http.register_view(CarrierSliderPageView)
+                self.hass.http.register_view(CarrierSliderVerifyView)
+                self.hass.http.register_view(CarrierMobileTutorialView)
+                domain_data["views_registered"] = True
+            except Exception:
+                pass
+
+        req_host = ""
+        req_scheme = "http"
+        try:
+            from homeassistant.components.http import current_request
+            req = current_request.get()
+            if req and req.host:
+                req_host = req.host
+                req_scheme = req.scheme or "http"
+        except Exception:
+            pass
+
+        if req_host:
+            if "127.0.0.1" in req_host:
+                target_host = req_host.replace("127.0.0.1", "localhost")
+            elif "localhost" in req_host:
+                target_host = req_host.replace("localhost", "127.0.0.1")
+            else:
+                target_host = req_host
+            return f"{req_scheme}://{target_host}/api/shaobo_pocket_carrier/slider?flow_id={self.flow_id}"
+
+        return f"/api/shaobo_pocket_carrier/slider?flow_id={self.flow_id}"
+
     async def async_step_unicom_slider(self, user_input=None):
         """步骤2 (联通-方案一): 引导本地腾讯滑块验证并输入短信"""
         errors = {}
@@ -368,36 +402,13 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
         })
 
-        # 自动识别当前访问环境并生成跨源外部链接，使 HA 前端强制在新标签页中打开 (自带 target="_blank")
-        req_host = ""
-        req_scheme = "http"
-        try:
-            from homeassistant.components.http import current_request
-            req = current_request.get()
-            if req and req.host:
-                req_host = req.host
-                req_scheme = req.scheme or "http"
-        except Exception:
-            pass
-
-        if "127.0.0.1" in req_host:
-            target_host = req_host.replace("127.0.0.1", "localhost")
-        elif "localhost" in req_host:
-            target_host = req_host.replace("localhost", "127.0.0.1")
-        elif req_host:
-            target_host = req_host
-        else:
-            target_host = "localhost:8123"
-
-        slider_url = f"{req_scheme}://{target_host}/api/shaobo_pocket_carrier/slider?flow_id={self.flow_id}"
-
         return self.async_show_form(
             step_id="unicom_slider",
             data_schema=schema,
             errors=errors,
             description_placeholders={
                 "phone": self.phone,
-                "slider_url": slider_url,
+                "slider_url": self._get_unicom_slider_url(),
             },
         )
 
@@ -416,8 +427,19 @@ class ChinaCarrierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return await self.async_step_reauth_mobile()
             elif self.carrier == CARRIER_UNICOM:
                 self.unicom_client = UnicomClient(self.phone)
-                SLIDER_SESSIONS[self.flow_id] = self.unicom_client
-                return await self.async_step_unicom_slider()
+                try:
+                    await self.hass.async_add_executor_job(self.unicom_client.trigger_risk)
+                    app_id = await self.hass.async_add_executor_job(self.unicom_client.prepare_captcha)
+                    SLIDER_SESSIONS[self.flow_id] = {
+                        "client": self.unicom_client,
+                        "app_id": app_id,
+                        "mobile_hex": self.unicom_client.mobile_hex,
+                        "status": "pending",
+                    }
+                    return await self.async_step_unicom_slider()
+                except Exception as err:
+                    _LOGGER.error("联通重新认证风控预处理失败: %s", err)
+                    errors["base"] = "unicom_risk_failed"
             elif self.carrier == CARRIER_TELECOM:
                 # 重新认证时，继承并复用原有条目的设备型号，保持设备指纹一致稳定
                 existing_auth = {}

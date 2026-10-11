@@ -19,15 +19,26 @@ if (typeof window !== "undefined" && !window._carrierLinkInterceptorBound) {
     function (e) {
       try {
         const path = e.composedPath ? e.composedPath() : [];
-        const anchor = path.find((el) => el && el.tagName === "A");
+        let anchor = null;
+        for (let i = 0; i < path.length; i++) {
+          const el = path[i];
+          if (el && el.tagName === "A" && el.href) {
+            anchor = el;
+            break;
+          }
+        }
         if (
           anchor &&
           anchor.href &&
           (anchor.href.includes("/api/shaobo_pocket_carrier/mobile_tutorial") ||
-            anchor.href.includes("/api/shaobo_pocket_carrier/slider"))
+            anchor.href.includes("/api/shaobo_pocket_carrier/slider") ||
+            anchor.href.includes("/api/shaobo_pocket_carrier/verify_slider"))
         ) {
           e.preventDefault();
           e.stopPropagation();
+          if (typeof e.stopImmediatePropagation === "function") {
+            e.stopImmediatePropagation();
+          }
           window.open(anchor.href, "_blank", "noopener,noreferrer");
         }
       } catch (err) {}
